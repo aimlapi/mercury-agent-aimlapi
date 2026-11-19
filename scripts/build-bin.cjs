@@ -27,14 +27,24 @@
  *
  * Usage:
  *   node scripts/build-bin.cjs                # host target only
+ *   node scripts/build-bin.cjs --host-only    # same, spelled out (CI smoke)
  *   node scripts/build-bin.cjs --all          # all configured targets
  *   node scripts/build-bin.cjs --force        # overwrite existing binaries
  *   node scripts/build-bin.cjs --all --force
+ *   node scripts/build-bin.cjs --dev          # dev channel: all targets into
+ *                                             # release/dev (rolling, wiped
+ *                                             # each run; publish-dev.sh
+ *                                             # uploads it as the rolling
+ *                                             # mercury-dev-latest pre-release)
  *
  * Cross-compilation:
  *   Bun ships its own runtime per target, so cross-compile works for JS.
- *   Native addons still need target-specific packaging; sql.js is not a
- *   general fallback for every better-sqlite3-backed feature.
+ *   Native addons still need target-specific packaging: better-sqlite3's
+ *   addon is NOT in the binary, so inside it the shared driver
+ *   (src/utils/sqlite-driver.ts) falls through to `bun:sqlite`, which Bun
+ *   embeds on every target. `bun:sqlite` / `node:sqlite` are resolved at run
+ *   time via createRequire and are externals in tsup.config.ts; sql.js is
+ *   only the web dashboard's read-only fallback.
  */
 const { execFileSync, execSync, spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
@@ -44,7 +54,9 @@ const os = require('node:os');
 
 const root = path.join(__dirname, '..');
 const releaseRoot = path.join(root, 'release');
-const entry = path.join(root, 'dist', 'index.js');
+// The bundle itself; dist/index.js is only the Node version launcher, and
+// Bun binaries carry their own runtime.
+const entry = path.join(root, 'dist', 'mercury.js');
 
 function copyDirSync(src, dest) {
   fs.mkdirSync(dest, { recursive: true });
@@ -70,8 +82,13 @@ const ALL_TARGETS = [
   { id: 'bun-darwin-arm64', out: 'mercury-macos-arm64' },
   { id: 'bun-darwin-x64',   out: 'mercury-macos-x64' },
   { id: 'bun-linux-x64',    out: 'mercury-linux-x64' },
+  // Bun's x64 targets emit AVX2; CPUs without it (pre-2013 Intel, some VMs)
+  // die with "Illegal instruction" (#155). The baseline builds run anywhere;
+  // the installers pick them when the CPU lacks avx2 or the default crashes.
+  { id: 'bun-linux-x64-baseline',   out: 'mercury-linux-x64-baseline' },
   { id: 'bun-linux-arm64',  out: 'mercury-linux-arm64' },
   { id: 'bun-windows-x64',  out: 'mercury-win-x64.exe' },
+  { id: 'bun-windows-x64-baseline', out: 'mercury-win-x64-baseline.exe' },
 ];
 
 function hostTarget() {
@@ -179,7 +196,21 @@ function createWebArchive(versionDir, { required }) {
   }
 
   copyDirSync(webSrc, webDest);
-  execFileSync('tar', ['-czf', webTarPath, '-C', versionDir, 'web'], { cwd: root, stdio: 'pipe' });
+  // COPYFILE_DISABLE stops macOS tar from emitting AppleDouble (._*) entries
+  // for xattr-bearing files. Those entries are invisible to bsdtar's `-tzf`
+  // but visible to GNU tar, where they fail install.sh's `^web/` path check
+  // ("web.tar.gz contains an unsafe path" — see #122).
+  //
+  // --no-xattrs stops bsdtar from writing xattrs PAX headers
+  // (LIBARCHIVE.xattr.com.apple.provenance, stamped by macOS Gatekeeper).
+  // GNU tar doesn't know those keywords and warns one "ignoring unknown
+  // extended header keyword" line per file during install.sh's extract —
+  // harmless but very noisy on Linux (see #122).
+  execFileSync('tar', ['--no-xattrs', '-czf', webTarPath, '-C', versionDir, 'web'], {
+    cwd: root,
+    stdio: 'pipe',
+    env: { ...process.env, COPYFILE_DISABLE: '1' },
+  });
   if (required) fs.rmSync(webDest, { recursive: true, force: true });
   const sizeKB = (fs.statSync(webTarPath).size / 1024).toFixed(0);
   console.log(`  ✓ web.tar.gz (${sizeKB} KB)`);
@@ -215,17 +246,36 @@ if (!fs.existsSync(entry)) {
 
 const args = process.argv.slice(2);
 const buildAll = args.includes('--all');
+const buildDev = args.includes('--dev');
 const force = args.includes('--force');
-const unknownArgs = args.filter((arg) => arg !== '--all' && arg !== '--force');
+// `--host-only` is the explicit spelling of the default (host smoke build);
+// CI passes it so the intent survives a future change of default.
+const hostOnly = args.includes('--host-only');
+const unknownArgs = args.filter((arg) => !['--all', '--force', '--dev', '--host-only'].includes(arg));
 if (unknownArgs.length > 0) {
   console.error(`ERROR: unknown argument(s): ${unknownArgs.join(', ')}`);
   process.exit(1);
 }
+if (buildAll && buildDev) {
+  console.error('ERROR: --all and --dev are mutually exclusive.');
+  process.exit(1);
+}
+if (hostOnly && (buildAll || buildDev)) {
+  console.error('ERROR: --host-only cannot be combined with --all or --dev.');
+  process.exit(1);
+}
 
-const versionDir = buildAll
-  ? path.join(releaseRoot, `v${version}`)
-  : path.join(releaseRoot, 'smoke', `v${version}`);
-if (!buildAll && force) fs.rmSync(versionDir, { recursive: true, force: true });
+const versionDir = buildDev
+  ? path.join(releaseRoot, 'dev')
+  : buildAll
+    ? path.join(releaseRoot, `v${version}`)
+    : path.join(releaseRoot, 'smoke', `v${version}`);
+if (!buildAll && !buildDev && force) fs.rmSync(versionDir, { recursive: true, force: true });
+if (buildDev) {
+  // The dev channel is a rolling build (scripts/publish-dev.sh always
+  // replaces it wholesale) — no mix guard, just wipe and rebuild.
+  fs.rmSync(versionDir, { recursive: true, force: true });
+}
 if (buildAll && fs.existsSync(versionDir)) {
   if (!force && fs.readdirSync(versionDir).length > 0) {
     console.error(`ERROR: ${path.relative(root, versionDir)} already contains release assets.`);
@@ -237,9 +287,9 @@ if (buildAll && fs.existsSync(versionDir)) {
 fs.mkdirSync(versionDir, { recursive: true });
 
 const bun = findBun();
-const targets = buildAll ? ALL_TARGETS : [hostTarget()];
+const targets = buildDev || buildAll ? ALL_TARGETS : [hostTarget()];
 
-console.log(`\nMercury v${version} — building ${targets.length} ${buildAll ? 'release' : 'host smoke'} target(s) with ${bun}`);
+console.log(`\nMercury ${buildDev ? '(dev channel)' : `v${version}`} — building ${targets.length} ${buildDev || buildAll ? 'release' : 'host smoke'} target(s) with ${bun}`);
 console.log(`Output: ${path.relative(root, versionDir)}/${force ? '  (force overwrite)' : ''}\n`);
 
 const results = [];
@@ -248,15 +298,17 @@ for (const target of targets) {
   results.push(compile(bun, target, { force, versionDir }));
 }
 
-const webTarPath = createWebArchive(versionDir, { required: buildAll });
+const webTarPath = createWebArchive(versionDir, { required: buildDev || buildAll });
 writeChecksums(versionDir, [...results.map((result) => result.outPath), webTarPath]);
 
-if (buildAll) {
+if (buildDev || buildAll) {
   execFileSync(process.execPath, [path.join(__dirname, 'verify-standalone-release.cjs'), versionDir], {
     cwd: root,
     stdio: 'inherit',
   });
-  updateLatestSymlink();
+  // Only stable releases move the `release/latest` pointer — a dev build must
+  // never clobber what the stable channel resolves.
+  if (buildAll) updateLatestSymlink();
 }
 
 const built = results.filter((r) => !r.skipped).length;

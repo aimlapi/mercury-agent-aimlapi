@@ -16,7 +16,7 @@ export interface TelegramPendingRequest {
   pairingCode?: string;
 }
 
-export type ChannelType = 'cli' | 'telegram' | 'web' | 'internal' | 'signal' | 'discord' | 'slack' | 'whatsapp';
+export type ChannelType = 'cli' | 'telegram' | 'web' | 'internal' | 'signal' | 'discord' | 'slack' | 'whatsapp' | 'desktop';
 
 export interface ChannelMessage {
   id: string;
@@ -24,11 +24,32 @@ export interface ChannelMessage {
   channelType: ChannelType;
   senderId: string;
   senderName?: string;
+  /**
+   * Role of the sender on the originating channel, when the channel can
+   * distinguish it (e.g. Telegram admins vs approved members). Undefined for
+   * channels that have no notion of roles (CLI, internal). Used to keep
+   * admin-only capabilities (such as installing skills) out of the tool set
+   * exposed to non-admin chat participants.
+   */
+  senderRole?: "admin" | "member";
   content: string;
   timestamp: number;
   /** Canonical local session identity; channelId remains transport-specific. */
   sessionId?: string;
   metadata?: Record<string, unknown>;
+}
+
+/**
+ * A file the owner attached to a message. The runtime reads `path` at turn time
+ * and hands images/PDFs to the model when it can take them. TXT and Markdown
+ * are included as bounded text for every model (`src/core/attachments.ts`).
+ */
+export interface ChannelAttachment {
+  /** `image` and `document` are the kinds the runtime can hand to a model. */
+  kind: 'image' | 'document';
+  path: string;
+  mime?: string;
+  name?: string;
 }
 
 export interface ChannelConfig {

@@ -1,11 +1,23 @@
 import { existsSync } from 'node:fs';
 import { posix as posixPath } from 'node:path';
 
+/**
+ * Platforms on which a Termux environment can exist. Node built by the
+ * Termux package repo (`pkg install nodejs`) reports `process.platform ===
+ * 'android'`, NOT `'linux'` — gating on `'linux'` alone made every real
+ * Termux device look like a desktop and sent `installService()` down the
+ * "Unsupported platform: android" path. Keep both: some Termux setups (and
+ * proot/glibc Node builds) still report `'linux'`.
+ */
+export function isTermuxEligiblePlatform(platform: NodeJS.Platform = process.platform): boolean {
+  return platform === 'linux' || platform === 'android';
+}
+
 export function isTermux(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): boolean {
-  if (platform !== 'linux') return false;
+  if (!isTermuxEligiblePlatform(platform)) return false;
   return Boolean(
     env.TERMUX_VERSION ||
     env.TERMUX_APP_PID ||
@@ -22,7 +34,9 @@ export function resolveShell(
   if (isTermux(env, platform)) {
     candidates.push(env.PREFIX ? posixPath.join(env.PREFIX, 'bin', 'sh') : undefined);
   }
-  candidates.push('/bin/sh');
+  const fallback = platform === 'win32' ? 'cmd.exe' : '/bin/sh';
+  if (platform === 'win32') candidates.push(env.ComSpec || env.COMSPEC);
+  candidates.push(fallback);
 
-  return candidates.find((candidate) => candidate && fileExists(candidate)) || '/bin/sh';
+  return candidates.find((candidate) => candidate && fileExists(candidate)) || fallback;
 }

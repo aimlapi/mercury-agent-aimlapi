@@ -5,6 +5,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
+import { createEventStream, type EventStream } from "@/lib/sse";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   DndContext,
@@ -100,7 +101,6 @@ import {
 } from "@/components/ui/sheet";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { cn } from "@/lib/utils";
 import { formatDate, formatTokens, truncate } from "@/lib/utils";
 import api, {
@@ -415,7 +415,7 @@ function BoardDetailView({ boardId, onBack }: { boardId: string; onBack: () => v
   const [plan, setPlan] = useState<ExecutionPlan | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval>>();
-  const sseRef = useRef<EventSource | null>(null);
+  const sseRef = useRef<EventStream | null>(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -444,8 +444,7 @@ function BoardDetailView({ boardId, onBack }: { boardId: string; onBack: () => v
     load();
 
     // Use SSE for real-time updates, fallback to polling
-    const baseUrl = window.location.origin;
-    const es = new EventSource(`${baseUrl}/api/boards/${boardId}/events`);
+    const es = createEventStream(`/api/boards/${boardId}/events`);
     sseRef.current = es;
 
     es.addEventListener('board-update', (e) => {
@@ -2028,8 +2027,10 @@ function AttachmentsTab({ card, boardId, onDelete }: { card: BoardCard; boardId:
   );
 }
 
-// Simple markdown renderer (handles headers, bold, code blocks, lists)
-function MarkdownRenderer({ content }: { content: string }) {
+// Simple markdown renderer (handles headers, bold, code blocks, lists).
+// Local by design — the chat MarkdownRenderer (react-markdown) is heavier
+// than card previews need; className passes through to the wrapper div.
+function MarkdownRenderer({ content, className }: { content: string; className?: string }) {
   const lines = content.split('\n');
   const elements: JSX.Element[] = [];
   let inCodeBlock = false;
@@ -2088,7 +2089,7 @@ function MarkdownRenderer({ content }: { content: string }) {
     );
   }
 
-  return <>{elements}</>;
+  return <div className={className}>{elements}</div>;
 }
 
 function renderInline(text: string): React.ReactNode {

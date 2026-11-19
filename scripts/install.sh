@@ -7,17 +7,26 @@
 #
 # Environment variables:
 #   MERCURY_VERSION   Version to install (e.g. "1.1.9"). Default: latest.
+#                     (Stable channel only — dev installs always track the
+#                     latest dev build.)
+#   MERCURY_CHANNEL   Distribution channel: "stable" (default) or "dev".
 #   MERCURY_INSTALL   Install prefix.    Default: $HOME/.mercury
+#                     ($HOME/.mercury-dev for the dev channel.)
 #                     The binary lands at $MERCURY_INSTALL/bin/mercury.
+#                     (mercury-dev on the dev channel.)
 #   MERCURY_NO_PATH   If set to "1", skip modifying shell rc files.
+#   MERCURY_DOWNLOAD_BASE
+#                     Base URL the release assets are fetched from. Default:
+#                     https://github.com/<repo>/releases/download — the
+#                     installer appends /v<version>/ (or the dev tag). Used by
+#                     CI to run this script against a local release directory.
 #
 # Windows users: use install.ps1 instead.
 
 set -eu
 
 REPO="cosmicstack-labs/mercury-agent"
-GITHUB_API="https://api.github.com/repos/${REPO}"
-GITHUB_DL="https://github.com/${REPO}/releases/download"
+GITHUB_DL="${MERCURY_DOWNLOAD_BASE:-https://github.com/${REPO}/releases/download}"
 
 # ----- helpers ---------------------------------------------------------------
 
@@ -33,6 +42,33 @@ die()   { err "$1"; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# ----- channel ---------------------------------------------------------------
+#
+# Stable is the default distribution channel — it resolves the numbered
+# GitHub release current users should install. The dev channel tracks the
+# rolling `mercury-dev-latest` PRE-release (feature previews that are NOT
+# "latest" on GitHub, so the stable installer and users never see them).
+# The two channels install under different prefixes with different binary
+# names, so a dev install coexists with a stable one on the same machine.
+CHANNEL="${MERCURY_CHANNEL:-stable}"
+
+case "$CHANNEL" in
+  stable)
+    RELEASE_TAG=""                 # resolved to v<version> at install time
+    DEFAULT_PREFIX="$HOME/.mercury"
+    BIN_NAME="mercury"
+    ;;
+  dev)
+    RELEASE_TAG="mercury-dev-latest"
+    DEFAULT_PREFIX="$HOME/.mercury-dev"
+    BIN_NAME="mercury-dev"
+    ;;
+  *)
+    err "Unknown MERCURY_CHANNEL '$CHANNEL' (expected stable or dev)."
+    exit 1
+    ;;
+esac
+
 # Detect OS in Mercury's release naming (macos | linux).
 detect_os() {
   uname_s=$(uname -s 2>/dev/null || echo unknown)
@@ -43,6 +79,20 @@ detect_os() {
       die "This installer doesn't support Windows shells. Use install.ps1 in PowerShell instead." ;;
     *) die "Unsupported operating system: $uname_s" ;;
   esac
+}
+
+# Linux x64 only: Bun's default x64 build uses AVX2. CPUs without it (Intel
+# before Haswell/2013, some VMs) crash with "Illegal instruction" (#155) —
+# the baseline build runs on any x86-64. MERCURY_CPUINFO exists for tests.
+cpu_has_avx2() {
+  cpuinfo=${MERCURY_CPUINFO:-/proc/cpuinfo}
+  [ -r "$cpuinfo" ] || return 0   # unknown → assume a modern CPU
+  grep -q -w avx2 "$cpuinfo"
+}
+
+# True when checksums.txt lists the asset (older releases have no baseline build).
+has_asset() {
+  awk -v a="$2" '$2 == a { found=1 } END { exit found ? 0 : 1 }' "$1"
 }
 
 # Detect arch in Mercury's release naming (arm64 | x64). We don't ship 32-bit.
@@ -131,21 +181,51 @@ maybe_update_path() {
   case ":$PATH:" in *":$bin_dir:"*) return 0 ;; esac
 
   rc=$(shell_rc_file)
-  marker='# added by mercury installer'
+  # Channel-suffixed sentinel: stable and dev installs must not shadow each
+  # other's rc entries — a shared marker made the second channel's PATH
+  # append a silent no-op ("already present" while never adding its dir).
+  marker="# added by mercury installer ($CHANNEL)"
   if [ -f "$rc" ] && grep -Fq "$marker" "$rc" 2>/dev/null; then
     info "PATH entry already present in $(basename "$rc")"
     return 0
   fi
 
   mkdir -p "$(dirname "$rc")"
+  # The literal `$PATH` must land in the rc file unexpanded (SC2016 is the point).
   case "$rc" in
     *config.fish)
+      # shellcheck disable=SC2016
       printf '\n%s\nset -gx PATH %s $PATH\n' "$marker" "$bin_dir" >> "$rc" ;;
     *)
+      # shellcheck disable=SC2016
       printf '\n%s\nexport PATH="%s:$PATH"\n' "$marker" "$bin_dir" >> "$rc" ;;
   esac
   info "Added $bin_dir to PATH in $(basename "$rc")"
   PATH_UPDATED=1
+}
+
+# Keep backups until both artifacts have been promoted. A failed rollback leaves
+# its recovery directory intact rather than deleting the only working copy.
+cleanup_install() {
+  rollback_failed=0
+  if [ -n "$transaction_dir" ] && [ "$promotion_started" = 1 ] && [ "$promotion_complete" = 0 ]; then
+    for part in binary web; do
+      if [ "$part" = binary ]; then target="$bin_path"; candidate="$candidate_dir/$BIN_NAME";
+      else target="$bin_dir/web"; candidate="$candidate_dir/web"; fi
+      backup="$transaction_dir/previous-$part"
+      if [ -e "$backup" ] || [ -L "$backup" ]; then
+        if ! { rm -rf "$target" && mv "$backup" "$target"; }; then rollback_failed=1; fi
+      elif [ ! -e "$candidate" ]; then
+        rm -rf "$target" || rollback_failed=1
+      fi
+    done
+  fi
+  if [ "$rollback_failed" = 1 ]; then
+    err "Could not fully restore the previous installation. Recovery files: $transaction_dir"
+  elif [ -n "$transaction_dir" ]; then
+    rm -rf "$transaction_dir"
+  fi
+  rm -rf "$tmp_dir"
 }
 
 # ----- main ------------------------------------------------------------------
@@ -153,6 +233,10 @@ maybe_update_path() {
 main() {
   printf '\n%s\n' "$(c_bold '☿ Mercury installer')"
   printf '   Soul-driven AI agent · https://mercuryagent.sh\n\n'
+  if [ "$CHANNEL" = "dev" ]; then
+    printf '%s Dev channel — unstable preview builds.\n' "$(c_yellow '!')"
+    printf '  Installs as %s (coexists with stable).\n\n' "$DEFAULT_PREFIX/bin/$BIN_NAME"
+  fi
 
   termux_prefix=0
   case "${PREFIX:-}" in *com.termux*) termux_prefix=1 ;; esac
@@ -168,40 +252,61 @@ Install the supported Node.js package instead:
   info "Detected platform: ${os}-${arch}"
 
   version=${MERCURY_VERSION:-}
-  if [ -z "$version" ]; then
-    info "Resolving latest version from GitHub..."
-    version=$(resolve_latest_version)
+  if [ "$CHANNEL" = "dev" ]; then
+    release_dir="${GITHUB_DL}/${RELEASE_TAG}"
+    version_label="dev (rolling ${RELEASE_TAG})"
+  else
+    if [ -z "$version" ]; then
+      info "Resolving latest version from GitHub..."
+      version=$(resolve_latest_version)
+    fi
+    release_dir="${GITHUB_DL}/v${version}"
+    version_label="v${version}"
   fi
-  info "Installing Mercury v${version}"
+  info "Installing Mercury ${version_label}"
 
   asset="mercury-${os}-${arch}"
-  url="${GITHUB_DL}/v${version}/${asset}"
+  url="${release_dir}/${asset}"
 
-  prefix=${MERCURY_INSTALL:-"$HOME/.mercury"}
+  prefix=${MERCURY_INSTALL:-"$DEFAULT_PREFIX"}
   bin_dir="$prefix/bin"
-  bin_path="$bin_dir/mercury"
+  bin_path="$bin_dir/$BIN_NAME"
 
   tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/mercury.XXXXXX")
   binary_tmp="$tmp_dir/$asset"
   web_tmp="$tmp_dir/web.tar.gz"
   checksums_tmp="$tmp_dir/checksums.txt"
   stage_dir="$tmp_dir/stage"
-  trap 'rm -rf "$tmp_dir"' EXIT INT TERM
+  transaction_dir=''
+  promotion_started=0
+  promotion_complete=0
+  trap cleanup_install EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-  checksum_url="${GITHUB_DL}/v${version}/checksums.txt"
+  checksum_url="${release_dir}/checksums.txt"
   info "Downloading checksums.txt ..."
   fetch_to "$checksum_url" "$checksums_tmp" || die "Failed to download required checksums from $checksum_url"
+  # Pick the build this CPU can run. MERCURY_ASSET forces one (support use).
+  if [ -n "${MERCURY_ASSET:-}" ]; then
+    asset="$MERCURY_ASSET"
+  elif [ "$os" = "linux" ] && [ "$arch" = "x64" ] && ! cpu_has_avx2 && has_asset "$checksums_tmp" "mercury-linux-x64-baseline"; then
+    info "This CPU has no AVX2 — using the baseline build"
+    asset="mercury-linux-x64-baseline"
+  fi
+  url="${release_dir}/${asset}"
+  binary_tmp="$tmp_dir/$asset"
   expected_binary=$(checksum_for "$checksums_tmp" "$asset")
   expected_web=$(checksum_for "$checksums_tmp" "web.tar.gz")
 
   info "Downloading $asset ..."
   if ! fetch_to "$url" "$binary_tmp"; then
     die "Failed to download $url
-   The binary for v${version} on ${os}-${arch} may not have been published yet.
+   The binary for ${version_label} on ${os}-${arch} may not have been published yet.
    Browse releases: https://github.com/${REPO}/releases"
   fi
 
-  web_tar_url="${GITHUB_DL}/v${version}/web.tar.gz"
+  web_tar_url="${release_dir}/web.tar.gz"
   info "Downloading web.tar.gz ..."
   fetch_to "$web_tar_url" "$web_tmp" || die "Failed to download required web dashboard assets from $web_tar_url"
 
@@ -216,44 +321,97 @@ Install the supported Node.js package instead:
   info "Checksums verified (sha256)"
 
   tar -tzf "$web_tmp" > "$tmp_dir/web-files.txt" || die "Failed to inspect web.tar.gz"
-  awk '$0 !~ /^web(\/|$)/ || $0 ~ /(^|\/)\.\.(\/|$)/ { bad=1 } END { exit bad }' \
+  # Safe = the `web/` tree itself. AppleDouble sidecars (`._web` — macOS
+  # tar's xattr artifact, invisible to bsdtar but LISTED by GNU tar) are
+  # ignored, not rejected: they are inert files the extraction stage
+  # discards, and a hard reject bricked every Linux install of tarballs
+  # built before the COPYFILE_DISABLE fix (#122). Traversal stays fatal.
+  awk '$0 ~ /(^|\/)\.\.(\/|$)/ || ($0 !~ /^web(\/|$)/ && $0 !~ /^\._/) { bad=1 } END { exit bad }' \
     "$tmp_dir/web-files.txt" || die "web.tar.gz contains an unsafe path"
   mkdir -p "$stage_dir"
   tar -xzf "$web_tmp" -C "$stage_dir" || die "Failed to extract web dashboard assets"
   [ -d "$stage_dir/web" ] || die "web.tar.gz does not contain the required web directory"
 
+  # Stage on the install filesystem (not a potentially noexec /tmp), with
+  # dashboard assets beside the executable just as in the final installation.
   mkdir -p "$bin_dir"
-  mv "$binary_tmp" "$bin_path"
-  chmod +x "$bin_path"
-  rm -rf "$bin_dir/web"
-  mv "$stage_dir/web" "$bin_dir/web"
-  info "Web dashboard assets installed"
+  transaction_dir=$(mktemp -d "$bin_dir/.mercury-install.XXXXXX")
+  candidate_dir="$transaction_dir/candidate"
+  mkdir -p "$candidate_dir"
+  candidate_bin="$candidate_dir/$BIN_NAME"
+  mv "$binary_tmp" "$candidate_bin"
+  chmod +x "$candidate_bin"
+  mv "$stage_dir/web" "$candidate_dir/web"
 
-  # macOS: strip the quarantine attribute so Gatekeeper doesn't bark on
-  # unsigned binaries downloaded via curl.
+  # macOS: strip quarantine before testing the staged executable.
   if [ "$os" = "macos" ] && have xattr; then
-    xattr -d com.apple.quarantine "$bin_path" 2>/dev/null || true
+    xattr -d com.apple.quarantine "$candidate_bin" 2>/dev/null || true
   fi
 
+  # Validate before touching the working installation, including CPU fallback.
+  # The if form retains the failure status under set -e.
+  if smoke_out=$("$candidate_bin" --version 2>&1); then smoke_status=0; else smoke_status=$?; fi
+  # SIGILL (exit 132) on the default build = a CPU without AVX2 that
+  # /proc/cpuinfo did not reveal: switch to the staged baseline build.
+  if [ "$smoke_status" -ne 0 ] && [ "$os" = "linux" ] && [ "$arch" = "x64" ] && [ "$asset" != "mercury-linux-x64-baseline" ] \
+     && { [ "$smoke_status" -eq 132 ] || printf '%s' "$smoke_out" | grep -qi 'illegal instruction'; } \
+     && has_asset "$checksums_tmp" "mercury-linux-x64-baseline"; then
+    info "This CPU cannot run the default build (illegal instruction) — switching to the baseline build"
+    asset="mercury-linux-x64-baseline"
+    fetch_to "${release_dir}/${asset}" "$tmp_dir/$asset" || die "Failed to download ${release_dir}/${asset}"
+    [ "$(sha256_file "$tmp_dir/$asset")" = "$(checksum_for "$checksums_tmp" "$asset")" ] || die "Checksum mismatch for $asset"
+    mv "$tmp_dir/$asset" "$candidate_bin"
+    chmod +x "$candidate_bin"
+    if smoke_out=$("$candidate_bin" --version 2>&1); then smoke_status=0; else smoke_status=$?; fi
+  fi
+  if [ "$smoke_status" -eq 0 ]; then
+    info "Smoke test passed: $BIN_NAME --version → $smoke_out"
+  else
+    err "The downloaded binary failed to run: $candidate_bin --version"
+    printf '%s\n' "$smoke_out" | sed 's/^/    /' >&2
+    die "Mercury ${version_label} cannot run on ${os}-${arch}; the previous installation was preserved. Please report this at https://github.com/${REPO}/issues (include the lines above)."
+  fi
+
+  promotion_started=1
+  if [ -e "$bin_path" ] || [ -L "$bin_path" ]; then
+    mv "$bin_path" "$transaction_dir/previous-binary"
+  fi
+  if [ -e "$bin_dir/web" ] || [ -L "$bin_dir/web" ]; then
+    mv "$bin_dir/web" "$transaction_dir/previous-web"
+  fi
+  mv "$candidate_bin" "$bin_path"
+  mv "$candidate_dir/web" "$bin_dir/web"
+  promotion_complete=1
+  info "Web dashboard assets installed"
   info "Installed to $bin_path"
 
-  rm -rf "$tmp_dir"
+  cleanup_install
   trap - EXIT INT TERM
 
   PATH_UPDATED=0
   maybe_update_path "$bin_dir"
 
-  printf '\n%s Mercury v%s is ready.\n' "$(c_green '✓')" "$version"
+  printf '\n%s Mercury %s is ready.\n' "$(c_green '✓')" "$version_label"
 
   if [ "${PATH_UPDATED:-0}" = "1" ]; then
     printf '\n%s Restart your shell or run:\n' "$(c_yellow 'NOTE:')"
     printf '    source %s\n\n' "$(shell_rc_file)"
   fi
 
+  if [ "${PATH_UPDATED:-0}" = "1" ]; then
+    launch_hint="$BIN_NAME"
+  else
+    launch_hint="$bin_path"
+  fi
   printf 'Get started:\n'
   printf '   %s --help\n' "$bin_path"
-  printf '   %s              # first run launches setup wizard\n\n' \
-    "$([ "${PATH_UPDATED:-0}" = "1" ] && echo mercury || echo "$bin_path")"
+  printf '   %s              # first run launches setup wizard\n\n' "$launch_hint"
+
+  if [ "$CHANNEL" = "dev" ]; then
+    printf '%s Dev channel — preview builds, may break. Run to check:\n' "$(c_yellow 'NOTE:')"
+    printf '    %s version\n' "$bin_path"
+    printf 'Re-run this script to update to the latest dev build.\n\n'
+  fi
 }
 
 main "$@"

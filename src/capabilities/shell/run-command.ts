@@ -1,12 +1,16 @@
 import { tool, zodSchema } from 'ai';
 import { z } from 'zod';
-import { spawn } from 'node:child_process';
-import { resolve, isAbsolute } from 'node:path';
-import { existsSync } from 'node:fs';
+import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { basename, dirname, isAbsolute, resolve } from 'node:path';
+import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import type { PermissionManager } from '../permissions.js';
 import { redactSecrets } from '../../utils/redact.js';
 import { logger } from '../../utils/logger.js';
+import { pulseProgress, TOOL_PULSE_INTERVAL_MS } from '../../core/progress-pulse.js';
+import { planArgvExecution, minimalEnv, type ArgvPlan } from './argv-lane.js';
+import { killProcessTree, processTreeAlive, processTreeSpawnOptions, trackProcessTree, untrackProcessTree } from './process-tree.js';
+import { withMercuryGwsOnPath } from '../../google/gws-binary.js';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_BUFFER = 1024 * 1024;
@@ -19,31 +23,117 @@ interface ExecResult {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
+  /** The agent loop was aborted (user interrupt, watchdog) while the command ran. */
+  aborted: boolean;
 }
 
-function executeCommand(command: string, cwd: string, timeoutMs: number): Promise<ExecResult> {
+interface ExecOptions {
+  /** Abort from the agent loop; the child is terminated when it fires. */
+  signal?: AbortSignal;
+  /** Called on output and periodically while the child is alive. */
+  onActivity?: () => void;
+}
+
+/**
+ * Approval-lane executor: runs the exact string the user approved through
+ * the platform shell.
+ */
+export function executeCommand(command: string, cwd: string, timeoutMs: number, options: ExecOptions = {}): Promise<ExecResult> {
+  const env = shellEnv();
+  return superviseChild(() => spawn(command, [], {
+    cwd,
+    env: withMercuryGwsOnPath(env) ?? env,
+    shell: true,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    // Its own process group, so a stop ends everything it started.
+    ...processTreeSpawnOptions(),
+  }), timeoutMs, options);
+}
+
+/**
+ * The approval lane's environment: the owner's, with the Node that runs
+ * Mercury first on PATH. A service PATH often lists an old system Node
+ * (/usr/local/bin) before a newer one, so `node`, `npx` and every Node CLI
+ * (`hyperframes`, needing Node 22) ran on Node 18 and refused, and the
+ * model went round the failure instead of doing the task. Not when Mercury
+ * runs as a standalone binary (its executable isn't a Node).
+ */
+export function shellEnv(source: NodeJS.ProcessEnv = process.env, execPath: string = process.execPath, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv {
+  const exe = basename(execPath).toLowerCase();
+  if (exe !== 'node' && exe !== 'node.exe') return source;
+  const sep = platform === 'win32' ? ';' : ':';
+  const own = dirname(execPath);
+  const rest = (source.PATH ?? source.Path ?? '').split(sep).filter((d) => d && d !== own);
+  return { ...source, PATH: [own, ...rest].join(sep) };
+}
+
+/**
+ * Argv-lane executor: `execFile(absBinary, args)` with no shell and a
+ * minimal environment (pinned PATH, no secrets). Used only for commands the
+ * argv lane auto-approved.
+ */
+export function executeArgv(file: string, args: readonly string[], cwd: string, timeoutMs: number, options: ExecOptions = {}): Promise<ExecResult> {
+  return superviseChild(() => execFile(file, [...args], {
+    cwd,
+    env: minimalEnv(),
+    shell: false,
+    windowsHide: true,
+    ...processTreeSpawnOptions(),
+    // Output is bounded by the stream handlers below; execFile's own buffer
+    // limit would kill a long but legitimate listing.
+    maxBuffer: Number.MAX_SAFE_INTEGER,
+  }, () => { /* results are collected from the streams */ }), timeoutMs, options);
+}
+
+function superviseChild(start: () => ChildProcess, timeoutMs: number, options: ExecOptions): Promise<ExecResult> {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
     let settled = false;
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     let sigkillHandle: ReturnType<typeof setTimeout> | undefined;
+    let pulseHandle: ReturnType<typeof setInterval> | undefined;
+    const { signal, onActivity } = options;
 
-    const child = spawn(command, [], {
-      cwd,
-      shell: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    let child: ChildProcess;
+    try {
+      child = start();
+    } catch (err: any) {
+      resolve({ stdout: '', stderr: `Process error: ${err?.message ?? String(err)}`, exitCode: null, timedOut: false, aborted: false });
+      return;
+    }
 
-    const finish = (exitCode: number | null, timedOut: boolean) => {
+    trackProcessTree(child);
+    const onAbort = () => terminate('abort');
+
+    const finish = (exitCode: number | null, timedOut: boolean, aborted = false) => {
       if (settled) return;
       settled = true;
       if (timeoutHandle) clearTimeout(timeoutHandle);
-      if (sigkillHandle) clearTimeout(sigkillHandle);
-      resolve({ stdout, stderr, exitCode, timedOut });
+      // NOT the SIGKILL timer: a terminated tree still gets its escalation.
+      if (pulseHandle) clearInterval(pulseHandle);
+      signal?.removeEventListener('abort', onAbort);
+      if (!sigkillHandle) untrackProcessTree(child);
+      resolve({ stdout, stderr, exitCode, timedOut, aborted });
     };
 
-    child.stdout.on('data', (chunk: Buffer) => {
+    // SIGTERM to the whole tree, then SIGKILL to whatever of it is still
+    // alive after a grace period (ADR-038). Used for the tool's own timeout
+    // and for an abort from the agent loop (the owner's Stop). Killing only
+    // the shell used to leave `npm run build` and friends running.
+    const terminate = (reason: 'timeout' | 'abort') => {
+      if (settled) return;
+      killProcessTree(child, 'SIGTERM');
+      sigkillHandle = setTimeout(() => {
+        if (processTreeAlive(child)) killProcessTree(child, 'SIGKILL');
+        untrackProcessTree(child);
+      }, SIGTERM_GRACE_MS);
+      sigkillHandle.unref?.();
+      finish(null, reason === 'timeout', reason === 'abort');
+    };
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      onActivity?.();
       if (stdout.length < MAX_BUFFER) {
         stdout += chunk.toString();
         if (stdout.length > MAX_BUFFER) {
@@ -52,7 +142,8 @@ function executeCommand(command: string, cwd: string, timeoutMs: number): Promis
       }
     });
 
-    child.stderr.on('data', (chunk: Buffer) => {
+    child.stderr?.on('data', (chunk: Buffer) => {
+      onActivity?.();
       if (stderr.length < MAX_BUFFER) {
         stderr += chunk.toString();
         if (stderr.length > MAX_BUFFER) {
@@ -70,48 +161,75 @@ function executeCommand(command: string, cwd: string, timeoutMs: number): Promis
       finish(code, false);
     });
 
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    // A quiet build (no output for minutes) is still progress as long as the
+    // child is alive and inside its own timeout. Pulse so the stall watchdog
+    // does not abort the turn underneath it.
+    if (onActivity) {
+      pulseHandle = setInterval(onActivity, TOOL_PULSE_INTERVAL_MS);
+    }
+
     if (timeoutMs > 0) {
-      timeoutHandle = setTimeout(() => {
-        if (!settled) {
-          child.kill('SIGTERM');
-          sigkillHandle = setTimeout(() => {
-            if (!settled) {
-              child.kill('SIGKILL');
-            }
-          }, SIGTERM_GRACE_MS);
-          finish(null, true);
-        }
-      }, timeoutMs);
+      timeoutHandle = setTimeout(() => terminate('timeout'), timeoutMs);
     }
   });
 }
 
-export function createRunCommandTool(permissions: PermissionManager, getCwd: () => string, setCwd: (dir: string) => void) {
+export function createRunCommandTool(permissions: PermissionManager, getCwd: () => string, setCwd: (dir: string) => boolean | void) {
   return tool({
     description: `Run a shell command in the current working directory. Use the cd tool to change directories first — cd commands within this tool only affect chained commands (e.g., "cd /path && ls"), not subsequent calls.
 Blocked commands (sudo, rm -rf /, etc.) are never executed.
-Auto-approved commands (ls, cat, git status, curl, etc.) run without asking.
-Other commands prompt the user for approval before execution.
+Simple read-only commands (ls, cat, grep, find, git status/log/diff, ...) with no pipes, redirection, variables or globs run without asking, executed directly (no shell).
+Everything else — including pipelines and && chains — prompts the user for approval before execution.
 The optional timeout parameter sets how long (in seconds) the command can run before being killed (default 120, max 600). For very long builds or test suites, set a higher timeout or use /bg to run the command in the background.`,
     inputSchema: zodSchema(z.object({
       command: z.string().describe('The shell command to execute'),
       timeout: z.number().min(10).max(600).default(120).optional().describe('Timeout in seconds (default 120, max 600). Increase for long-running commands like builds or test suites.'),
     })),
-    execute: async ({ command, timeout }) => {
-      const check = await permissions.checkShellCommand(command);
+    execute: async ({ command, timeout }, toolOptions?: { abortSignal?: AbortSignal }) => {
+      const cwd = getCwd();
+      const check = await permissions.checkShellCommand(command, { cwd });
       if (!check.allowed) {
         return `Error: ${check.reason}`;
       }
 
-      const cwd = getCwd();
       const timeoutMs = (timeout ?? 120) * 1000;
 
+      // Any command the argv lane can express runs through execFile, whichever
+      // lane approved it; only commands that need a shell reach one.
+      const plan = planArgvExecution(command);
+      if (plan?.kind === 'builtin') {
+        return runBuiltin(plan, cwd, setCwd);
+      }
+      if (check.lane === 'argv' && !plan) {
+        // Classified for the argv lane but no longer executable that way
+        // (e.g. the binary vanished): never fall back to a shell unapproved.
+        return 'Error: command could not be executed without a shell; it requires approval.';
+      }
+
       try {
-        logger.info({ cmd: command, cwd, timeoutMs }, 'Executing shell command');
-        const result = await executeCommand(command, cwd, timeoutMs);
+        logger.info({ cmd: command, cwd, timeoutMs, lane: plan ? 'argv' : 'shell' }, 'Executing command');
+        const execOptions = { signal: toolOptions?.abortSignal, onActivity: pulseProgress };
+        const result = plan
+          ? await executeArgv(plan.file, plan.args, cwd, timeoutMs, execOptions)
+          : await executeCommand(command, cwd, timeoutMs, execOptions);
 
         if (result.stdout || result.stderr) {
           detectCd(command, cwd, setCwd);
+        }
+
+        if (result.aborted) {
+          const partial = result.stdout?.trim();
+          let msg = '⛔ Command stopped: the turn was interrupted before it finished.';
+          if (partial) msg += `\nPartial output:\n${redactSecrets(partial.split('\n').slice(-30).join('\n'))}`;
+          return msg;
         }
 
         if (result.timedOut) {
@@ -157,7 +275,22 @@ The optional timeout parameter sets how long (in seconds) the command can run be
   });
 }
 
-function detectCd(command: string, currentCwd: string, setCwd: (dir: string) => void): void {
+/** `cd` in the argv lane: change the tool cwd in-process (it is a shell builtin). */
+function runBuiltin(plan: Extract<ArgvPlan, { kind: 'builtin' }>, cwd: string, setCwd: (dir: string) => boolean | void): string {
+  const target = plan.argv[1] ?? homedir();
+  const resolved = isAbsolute(target) ? resolve(target) : resolve(cwd, target);
+  try {
+    if (!statSync(resolved).isDirectory()) return `Error: Not a directory: ${resolved}`;
+  } catch {
+    return `Error: Directory not found: ${resolved}`;
+  }
+  if (setCwd(resolved) === false) {
+    return `Error: you can only change directory inside your own work folders. Use absolute paths to work with ${resolved}.`;
+  }
+  return `Changed directory to ${resolved}`;
+}
+
+function detectCd(command: string, currentCwd: string, setCwd: (dir: string) => boolean | void): void {
   const trimmed = command.trim();
 
   const cdOnly = trimmed.match(/^cd\s+(.+)$/);

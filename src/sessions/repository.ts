@@ -1,14 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getMercuryHome, getMemoryDir } from '../utils/config.js';
 import type { ChannelType } from '../types/channel.js';
+import { fallbackSessionTitle } from './title.js';
 import type { AppendSessionMessageInput, CreateSessionInput, Session, SessionBinding, SessionMessage } from './types.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ID_PREFIX_RE = /^[0-9a-f]{4,32}$/i;
 const ALIAS_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/i;
-const CHANNEL_TYPES: ChannelType[] = ['cli', 'telegram', 'web', 'internal', 'signal', 'discord', 'slack', 'whatsapp'];
+const CHANNEL_TYPES: ChannelType[] = ['cli', 'telegram', 'web', 'internal', 'signal', 'discord', 'slack', 'whatsapp', 'desktop'];
 const TITLE_SOURCES: Session['titleSource'][] = ['fallback', 'generated', 'user'];
 const SESSION_STATUSES: Session['status'][] = ['active', 'archived', 'deleted'];
 const MESSAGE_ROLES: SessionMessage['role'][] = ['user', 'assistant', 'system', 'tool'];
@@ -70,6 +71,15 @@ export class SessionResolutionError extends Error {
   }
 }
 
+export class SessionTitleError extends Error {}
+
+export class SessionReadError extends Error {
+  constructor(message: string, readonly bytesRead: number, readonly fileSize?: number) {
+    super(message);
+    this.name = 'SessionReadError';
+  }
+}
+
 export class SessionRepository {
   readonly rootDir: string;
   private readonly indexPath: string;
@@ -123,10 +133,46 @@ export class SessionRepository {
   }
 
   list(options: { includeArchived?: boolean; includeDeleted?: boolean } = {}): Session[] {
+    return this.listSummaries(options).map((entry) => this.readSession(entry.id));
+  }
+
+  /** Index metadata only: callers can page without loading every transcript. */
+  listSummaries(options: { includeArchived?: boolean; includeDeleted?: boolean } = {}): SessionIndexEntry[] {
     return this.index.sessions
       .filter((entry) => entry.status === 'active' || (options.includeArchived && entry.status === 'archived') || (options.includeDeleted && entry.status === 'deleted'))
       .sort((a, b) => b.updatedAt - a.updatedAt)
-      .map((entry) => this.readSession(entry.id));
+      .map((entry) => ({ ...entry }));
+  }
+
+  /** Bounded, read-only access for recall; no path is accepted from the model. */
+  readBounded(ref: string, maxBytes: number): { session: Session; bytes: number } {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error('Invalid session read limit');
+    const entry = this.resolveEntry(ref);
+    const fd = openSync(join(this.rootDir, `${entry.id}.json`), 'r');
+    let bytes = 0;
+    let size: number | undefined;
+    try {
+      size = fstatSync(fd).size;
+      if (size > maxBytes) throw new Error('Session exceeds the recall read limit');
+      // Repository writes use atomic rename, so the descriptor normally stays
+      // stable. Never read past the bound, even if another writer grows it.
+      const buffer = Buffer.alloc(size);
+      while (bytes < buffer.length) {
+        const n = readSync(fd, buffer, bytes, buffer.length - bytes, bytes);
+        if (!n) break;
+        bytes += n;
+      }
+      if (fstatSync(fd).size !== size) throw new Error('Session changed during recall; try again');
+      const session: unknown = JSON.parse(buffer.subarray(0, bytes).toString('utf8'));
+      if (!this.isValidSession(session, entry.id)) throw new Error('Invalid session');
+      return { session, bytes };
+    } catch {
+      // Failed JSON/validation still consumed disk bytes and must count toward
+      // the caller's aggregate scan budget. Do not expose parser/file content.
+      throw new SessionReadError('Could not read session within the limit', bytes, size);
+    } finally {
+      closeSync(fd);
+    }
   }
 
   get(ref: string): Session {
@@ -220,15 +266,69 @@ export class SessionRepository {
     return message;
   }
 
-  updateTitle(ref: string, title: string, titleSource: Session['titleSource'] = 'user'): Session {
+  /**
+   * Take back a message and everything after it (undo the last exchange):
+   * it leaves the history the agent reads, so Mercury forgets it too.
+   * Returns what was removed, oldest first.
+   */
+  removeFrom(sessionRef: string, messageId: string): SessionMessage[] {
+    const session = this.get(sessionRef);
+    const at = session.messages.findIndex((message) => message.id === messageId.toLowerCase());
+    if (at < 0) throw new Error('Message not found in this session');
+    const removed = session.messages.splice(at);
+    this.touchAndWrite(session);
+    this.writeIndex();
+    this.notifyMutation();
+    return removed;
+  }
+
+  /**
+   * Rename a session. `touch: false` renames without counting as activity,
+   * so the session keeps its place in the list (used when repairing titles).
+   */
+  updateTitle(ref: string, title: string, titleSource: Session['titleSource'] = 'user', options: { touch?: boolean } = {}): Session {
     const normalized = title.replace(/\s+/g, ' ').trim();
-    if (!normalized) throw new Error('Session title is required');
-    if (normalized.length > 120) throw new Error('Session title must be 120 characters or fewer');
+    if (!normalized) throw new SessionTitleError('Session title is required');
+    const characters = Array.from(normalized);
+    if (characters.length > 120) throw new SessionTitleError('Session title must be 120 characters or fewer');
+    // for...of leaves unpaired surrogates intact; reject them rather than
+    // persisting a title that changes when encoded by a client or filesystem.
+    if (characters.some((character) => {
+      const point = character.codePointAt(0)!;
+      return point < 32 || (point >= 127 && point <= 159) || (point >= 0xd800 && point <= 0xdfff);
+    })) throw new SessionTitleError('Session title must contain valid text without control characters');
     const session = this.get(ref);
+    // A background generation/repair may finish after the owner renamed it.
+    if (session.titleSource === 'user' && titleSource !== 'user') return session;
     if (session.title === normalized && session.titleSource === titleSource) return session;
     session.title = normalized;
     session.titleSource = titleSource;
-    this.touchAndWrite(session);
+    if (options.touch === false) {
+      session.revision++;
+      this.writeSession(session);
+      const index = this.index.sessions.findIndex((entry) => entry.id === session.id);
+      if (index >= 0) this.index.sessions[index] = this.toIndexEntry(session);
+    } else {
+      this.touchAndWrite(session);
+    }
+    this.writeIndex();
+    this.notifyMutation();
+    return this.get(session.id);
+  }
+
+  /**
+   * Save a session to come back to, or unsave it. Saving is a bookmark, not
+   * activity: the session keeps its place in the list (updatedAt stays).
+   */
+  setSaved(ref: string, saved: boolean): Session {
+    const session = this.get(ref);
+    if (!!session.savedAt === saved) return session;
+    if (saved) session.savedAt = Date.now();
+    else delete session.savedAt;
+    session.revision++;
+    this.writeSession(session);
+    const index = this.index.sessions.findIndex((entry) => entry.id === session.id);
+    if (index >= 0) this.index.sessions[index] = this.toIndexEntry(session);
     this.writeIndex();
     this.notifyMutation();
     return this.get(session.id);
@@ -389,8 +489,7 @@ export class SessionRepository {
   }
 
   private fallbackTitle(content: string): string {
-    const normalized = content.replace(/\s+/g, ' ').trim();
-    return normalized.length > 60 ? `${normalized.slice(0, 57)}...` : normalized || 'New session';
+    return fallbackSessionTitle(content);
   }
 
   private touchAndWrite(session: Session, timestamp = Date.now()): void {
@@ -600,7 +699,7 @@ export class SessionRepository {
 
   private legacyChannelType(id: string): ChannelType {
     const prefix = id.split(':', 1)[0];
-    return ['cli', 'telegram', 'web', 'internal', 'signal', 'discord', 'slack', 'whatsapp'].includes(prefix) ? prefix as ChannelType : 'internal';
+    return ['cli', 'telegram', 'web', 'internal', 'signal', 'discord', 'slack', 'whatsapp', 'desktop'].includes(prefix) ? prefix as ChannelType : 'internal';
   }
 
   private assertUuid(id: string): void {

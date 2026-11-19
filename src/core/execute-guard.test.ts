@@ -4,6 +4,8 @@ import {
   MAX_VERIFICATION_CONTINUATIONS,
   executeContinuationPrompt,
   isFailedToolResult,
+  isTextDeliverableRequest,
+  isVerificationOutputOk,
   responseAsksUser,
   shouldForceExecuteContinuation,
   shouldRequireVerification,
@@ -12,6 +14,46 @@ import {
 } from './execute-guard.js';
 
 const ok = (names: string[]): Map<string, boolean> => new Map(names.map((n) => [n, true]));
+
+describe('chat delivery contract', () => {
+  it('text deliverables are exempt — the reply itself is the work', () => {
+    for (const text of [
+      'write a poem about the sea',
+      'draft an email to the landlord',
+      'give me a catchy slogan for the app',
+      'write a short story about a fox',
+      'write the lyrics for a chorus',
+      'write a haiku about autumn',
+      'brainstorm names for the project',
+      'write a blog post intro',
+    ]) {
+      expect(isTextDeliverableRequest(text), text).toBe(true);
+    }
+  });
+
+  it('repo/code-shaped requests are NOT text deliverables — the guard applies in chat', () => {
+    for (const text of [
+      'fix the login bug',
+      'build a dashboard for the API',
+      'add tests to the auth module',
+      'refactor the session store',
+      'create a component for the settings page',
+      'implement the endpoint',
+      'set up the database schema',
+    ]) {
+      expect(isTextDeliverableRequest(text), text).toBe(false);
+    }
+  });
+
+  it('the narration guard still fires for chat implementation requests with no tools', () => {
+    expect(shouldForceExecuteContinuation({
+      taskText: 'fix the login bug',
+      hasApprovedPlan: false,
+      toolsUsed: [],
+      toolsSucceeded: new Map(),
+    })).toBe(true);
+  });
+});
 
 describe('execute-mode completion guard', () => {
   it('forces continuation when an implementation request ended with no tools', () => {
@@ -241,6 +283,31 @@ describe('evidence-based verification gate', () => {
     expect(MAX_VERIFICATION_CONTINUATIONS).toBe(1);
   });
 
+  // Regression: a verification command that FAILED or TIMED OUT used to
+  // satisfy the gate because only the command string was inspected. With
+  // result tracking, only a clean run after the last edit counts.
+  it('a failed or timed-out verification is not evidence', () => {
+    const base = {
+      taskText: 'add the export endpoint',
+      hasApprovedPlan: false,
+      commandsRun: ['npm test'],
+      toolsSucceeded: ok(['edit_file']),
+    };
+    expect(shouldRequireVerification({ ...base, verifiedOk: false })).toBe(true);
+    expect(shouldRequireVerification({ ...base, verifiedOk: true })).toBe(false);
+    // Without result tracking the legacy string heuristic still applies.
+    expect(shouldRequireVerification(base)).toBe(false);
+  });
+
+  it('classifies verification output by outcome, not by command name', () => {
+    expect(isVerificationOutputOk('Tests  25 passed (25)\nDuration 421ms')).toBe(true);
+    expect(isVerificationOutputOk('Command exited with code 1\nFAIL src/app.test.ts')).toBe(false);
+    expect(isVerificationOutputOk('⏱ Command timed out after 120s.\nPartial output:\n...')).toBe(false);
+    expect(isVerificationOutputOk('Error: Permission denied for shell command')).toBe(false);
+    expect(isVerificationOutputOk('src/app.ts(12,5): error: TS2322: Type ...')).toBe(false);
+    expect(isVerificationOutputOk('')).toBe(false);
+  });
+
   it('builds a verification nudge', () => {
     const prompt = verificationPrompt('add the export endpoint');
     expect(prompt).toContain('EXECUTE-MODE VERIFICATION');
@@ -271,5 +338,16 @@ describe('wakeUpPrompt — the final automatic attempt', () => {
     expect(prompt).toContain('create_file');
     expect(prompt).toContain('ZERO prose');
     expect(prompt).toContain('3D world');
+  });
+});
+
+describe('chat: check before done', () => {
+  it('only when the turn made something', async () => {
+    const { chatNeedsCheck, chatCheckPrompt } = await import('./execute-guard.js');
+    expect(chatNeedsCheck(new Map([['run_command', true]]))).toBe(true);
+    expect(chatNeedsCheck(new Map([['run_command', false], ['web_search', true]]))).toBe(false);
+    expect(chatNeedsCheck(new Map([['read_file', true]]))).toBe(false);
+    expect(chatCheckPrompt('make an intro video')).toMatch(/probe a video/);
+    expect(chatCheckPrompt()).toMatch(/do not present a workaround/);
   });
 });

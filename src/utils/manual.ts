@@ -1,5 +1,194 @@
 import chalk from 'chalk';
 
+/** In-chat commands and what they do: the manual's table, and the descriptions in the desktop's / picker. */
+export const CHAT_COMMAND_HELP: ReadonlyArray<readonly [string, string]> = [
+  ['/bots', 'List your bots and fleets with their state'],
+  ['/bots list', 'List your bots and fleets with their state'],
+  ['/bots open <id>', "Open a bot's own chat"],
+  ['/bots create <id> "Name" "Description"', 'Create a bot (then set its persona, permissions, fleet and budget)'],
+  ['/bots send <id> <message>', 'Give a bot a task'],
+  ['/bots persona <id> <text>', "Replace a bot's persona"],
+  ['/bots budget <id> <tokens|suggest|none>', "Set a bot's daily token budget"],
+  ['/bots edit <id> <field> <value>', 'Change one setting: name, description, model, memory, tools, autonomy'],
+  ['/bots delete <id>', 'Delete a bot (a lead takes its crew with it)'],
+  ['/bots journal <id>', "A bot's recent runs and what each produced"],
+  ['/bots inbox <id>', "Mail waiting in a bot's mailbox"],
+  ['/bots storage', 'Disk used by each bot'],
+  ['/bots enable <id>', 'Turn a bot on'],
+  ['/bots disable <id>', 'Turn a bot off'],
+  ['/bots stop <id>', 'Stop a bot now and hold its queued work'],
+  ['/bots stop all', 'Stop every bot'],
+  ['/bots start <id>', 'Start a stopped bot again'],
+  ['/bots start all', 'Start every stopped bot'],
+  ['/bots run <id>', 'Run a bot now'],
+  ['/bots cost', 'Token spend per bot'],
+  ['/bots show <id> [runId]', 'What a run did: its tool steps and reply'],
+  ['/bots outputs', 'Files your bots delivered'],
+  ['/bots folder <id>', "Open a bot's deliverables folder"],
+  ['/bots fetch <id> [name|latest]', 'Send a delivered file to this chat'],
+  ['/bots tasks <leadId>', 'Tasks a fleet lead handed out, and what came back'],
+  ['/bots dlq', 'Runs that failed for good (dead-letter queue)'],
+  ['/bots dlq clear', 'Clear the dead-letter queue'],
+  ['/bots replay <id> <jobId>', 'Run a dead-lettered job again'],
+  ['/bots crew <leadId>', "A fleet lead's crew"],
+  ['/bots promote <id>', 'Make a bot a fleet lead'],
+  ['/bots demote <id>', 'Make a fleet lead a bot on its own again'],
+  ['/bots permissions <id> [tier]', "Show or set a bot's permission level"],
+  ['/bots add-crew <leadId> <id> "Name" "Description" "persona"', 'Add a crew member to a fleet'],
+  ['/bots remove-crew <leadId> <id>', 'Remove a crew member from a fleet'],
+  ['/bots export <id>', 'Export a bot as a bundle'],
+  ['/bots import <file>', 'Import a bot bundle'],
+  ['/bots doctor', 'Check bots for problems and suggest fixes'],
+  ['/bots help', 'All bot commands'],
+  ['/cloud', 'Mercury Cloud status and models'],
+  ['/ws', 'Workspace IDE mode: the file tree and git panel'],
+  ['/ws help', 'Workspace IDE commands'],
+  ['/start', 'Start Telegram pairing or request Telegram access'],
+  ['/pair', 'Start Telegram pairing or request Telegram access'],
+  ['/', 'Open the CLI command picker with arrow-key navigation'],
+  ['/menu', 'Open the CLI command picker with arrow-key navigation'],
+  ['/whatsnew', "See what's new in this Mercury version"],
+  ['/update ignore', 'Silence the offered update notice permanently'],
+  ['/help', 'Show this manual'],
+  ['/status', 'Show config and budget info'],
+  ['/sessions', 'List active canonical sessions'],
+  ['/session new', 'Create and switch to a new session'],
+  ['/session <ref>', 'Switch by UUID/prefix/alias'],
+  ['/session current', 'Show the current session'],
+  ['/session archive <ref>', 'Archive a session'],
+  ['/session delete <ref>', 'Permanently delete a session after confirmation'],
+  ['/progress', 'Show live status for the current long task'],
+  ['/log', 'Print the last finished task’s step log'],
+  ['/bg', 'Show background tasks and current task status'],
+  ['/bg current', 'Move the current task to the background (keeps running)'],
+  ['/bg list', 'List background tasks'],
+  ['/bg cancel <id>', 'Cancel a background task'],
+  ['/bg clear', 'Remove finished background tasks from the list'],
+  ['/bg killall', 'Cancel all background tasks'],
+  ['/budget', 'Show token budget status'],
+  ['/budget override', 'Allow one request past the budget'],
+  ['/budget reset', 'Reset daily usage to zero'],
+  ['/budget set <n>', 'Set the daily token budget'],
+  ['/telegram', 'CLI chat only: open the Telegram management menu'],
+  ['/telegram pending', 'CLI chat only: list pending Telegram requests'],
+  ['/telegram users', 'CLI chat only: list approved Telegram users'],
+  ['/telegram approve <code|id>', 'CLI chat only: approve the first pairing code or a later request'],
+  ['/telegram reject <id>', 'CLI chat only: reject a pending Telegram request'],
+  ['/telegram remove <id>', 'CLI chat only: remove an approved Telegram user'],
+  ['/telegram promote <id>', 'CLI chat only: promote a Telegram member to admin'],
+  ['/telegram demote <id>', 'CLI chat only: demote a Telegram admin to member'],
+  ['/telegram reset', 'CLI chat only: reset all Telegram access'],
+  ['/tools', 'List currently loaded tools'],
+  ['/mcp', 'Show MCP servers and whether they are connected'],
+  ['/mcp tools <server>', 'List the tools of an MCP server and which ones the agent may use'],
+  ['/skills', 'List installed skills'],
+  ['/skills search <query>', 'Search skills.mercuryagent.sh'],
+  ['/skills view <id>', 'Show details + registry URL for a skill'],
+  ['/skills install <id|url>', 'Install from the registry or a raw SKILL.md URL'],
+  ['/skills remove <id>', 'Uninstall a skill'],
+  ['/google', 'Show the Google Workspace connection'],
+  ['/google connect [write]', 'Connect Gmail, Drive and Docs through gws (read-only unless write)'],
+  ['/google connect <address>', 'Finish a Google sign-in started from another device'],
+  ['/google status', 'Show the Google account, gws and the security checks'],
+  ['/google disconnect', 'Sign gws out on the computer Mercury runs on'],
+  ['/call <when> [about …]', 'Schedule Mercury to call you on WhatsApp (9pm, in 20m, tomorrow 8:30am)'],
+  ['/calls', 'List or cancel scheduled calls'],
+  ['/plugins', 'Installed and available plugins, with status'],
+  ['/plugins install <id|path|url>', 'Install a plugin (shows what it needs first)'],
+  ['/plugins enable|disable <id>', 'Turn a plugin on or off'],
+  ['/plugins update [id]', 'Update plugins from the catalog'],
+  ['/plugins rollback <id>', 'Go back to the previous version'],
+  ['/plugins uninstall <id> [--purge]', 'Remove a plugin (keeps data unless --purge)'],
+  ['/plugins pair <id> <phone>', 'Link a channel plugin (e.g. WhatsApp) with a pairing code'],
+  ['/permissions', 'Change permission mode (Ask Me / Allow All)'],
+  ['/models', 'List configured providers and their models'],
+  ['/models use <provider>', 'Switch the default model (saved across restarts)'],
+  ['/image <prompt>', 'Make an image with an image model (add --landscape or --portrait)'],
+  ['/media', 'Show the image model in use and the ones your providers offer'],
+  ['/media image <number|auto>', 'Choose the default image model (or let Mercury pick)'],
+  ['/media refresh', 'Ask your providers again which image models they have'],
+  ['/say <text>', 'Say it out loud: a voice note in chat apps, audio in the apps (add --style "calm")'],
+  ['/video <shot>', 'Make a short video (3–15 s; --portrait, --seconds 6); it arrives here when ready'],
+  ['/music <style>', 'Make a song or instrumental (--instrumental, --seconds 60); it arrives here when ready'],
+  ['/media video <number|auto>', 'Choose the video model'],
+  ['/media music <number|auto>', 'Choose the music model'],
+  ['/media jobs', 'Videos and songs being made, and the last few made'],
+  ['/media speech <number|auto>', 'Choose what speaks (OpenAI, Gemini, ElevenLabs, Deepgram, or a provider model)'],
+  ['/media voice <name|default>', 'Choose the voice (e.g. nova, Kore)'],
+  ['/media replies <off|mirror|always>', 'When chat-app replies also come as a voice note (mirror: when you send one)'],
+  ['/effort', 'Show the thinking effort in this chat and the levels the model takes'],
+  ['/effort <auto|low|medium|high|xhigh|max>', 'Set the thinking effort for this chat only'],
+  ['/effort default', "Go back to the model's default effort in this chat"],
+  ['/effort global <level>', "Change the model's default effort (every chat without its own)"],
+  ['/cloud models', 'List Mercury Cloud models for your tier'],
+  ['/cloud use <model-id>', 'Switch to a Mercury Cloud model'],
+  ['/view', 'Toggle progress view (balanced/detailed)'],
+  ['/view balanced', 'Set compact progress view'],
+  ['/view detailed', 'Set full progress view'],
+  ['/memory', 'View and manage second brain memory'],
+  ['/stream', 'Toggle text streaming on/off (Telegram)'],
+  ['/stream on', 'Enable streaming (live text updates)'],
+  ['/stream off', 'Disable streaming (single message)'],
+  ['/saver', 'Show Token Saver Mode status and tokens saved'],
+  ['/saver on', 'Manually enable Token Saver Mode (terser, faster, cheaper)'],
+  ['/saver off', 'Disable Token Saver Mode'],
+  ['/saver toggle', 'Toggle Token Saver Mode on/off'],
+  ['/saver threshold <0-100>', 'Auto-engage threshold (default 75%; 0 to disable)'],
+  ['/saver auto on|off', 'Enable/disable automatic engagement at threshold'],
+  ['/saver routing on|off', 'Prefer cheap providers when saver is active (opt-in)'],
+  ['/agents', 'List all sub-agents and their status'],
+  ['/agents stop <id|all>', 'Stop a sub-agent or all sub-agents'],
+  ['/agents pause <id>', 'Pause a running sub-agent'],
+  ['/agents resume <id>', 'Resume a paused sub-agent'],
+  ['/agents config', 'Show sub-agent resource allocation'],
+  ['/agents set max <n>', 'Set max concurrent sub-agents'],
+  ['/code', 'Enter Mercury Code (full-screen coding TUI in current dir)'],
+  ['/code auto', 'Auto mode (default): plans and builds in one flow, confirms only large changes'],
+  ['/code plan', 'Switch to plan mode (analyze, present options, no coding)'],
+  ['/code execute', 'Switch to execute mode (implement plan step by step)'],
+  ['/code build', 'Alias of execute mode for build-focused coding'],
+  ['/code diff', 'Show the working-tree diff vs HEAD with syntax colors'],
+  ['/code init', 'Scan the repo and write/refresh AGENTS.md'],
+  ['/code workspace', 'Open current directory in workspace IDE mode'],
+  ['/code agent <task>', 'Delegate a coding task to a sub-agent in background'],
+  ['/code off', 'Exit programming mode (leaves Mercury Code screen)'],
+  ['/code exit', 'Leave Mercury Code (asks for confirmation)'],
+  ['/code chat', 'Switch back to regular chat instantly (alias: /code back)'],
+  ['/chat', 'Return to chat mode (tears down Mercury Code if active)'],
+  ['/code toggle', 'Cycle through: off → auto → plan → execute → off'],
+  ['/server', 'Remote access and security: devices, approvals, allowed addresses (this computer only)'],
+  ['/server approve <code>', 'Let a waiting device or remote action through (/server deny <code> refuses)'],
+  ['/server devices', 'Paired devices; /server revoke <id|name> signs one out'],
+  ['/server on | off', 'Allow or refuse other devices'],
+  ['/server check', 'The security check'],
+  ['/research', 'Show research status'],
+  ['/research on', 'Research your next message here (live sources, full report), then switch off'],
+  ['/research off', 'Cancel research for your next message'],
+  ['/research toggle', 'Switch research on/off for your next message'],
+  ['/research <topic>', 'Research a topic now'],
+  ['/research plan <topic>', 'Show the research plan first; edit it, then start'],
+  ['/research continue', 'Continue the last research here, filling its gaps'],
+  ['/research retry', "Retry the sources the last research couldn't read"],
+  ['/ws exit', 'Exit workspace IDE mode back to general chat'],
+  ['/ws open <path>', 'Open a workspace directory in IDE mode'],
+  ['/ws refresh', 'Refresh file tree + git status panel'],
+  ['/ws stage <file|all>', 'Stage a file or all changes'],
+  ['/ws commit <message>', 'Commit staged changes (Mercury co-authored)'],
+  ['/ws undo <file>', 'Revert file changes with git checkout -- <file>'],
+  ['/halt', 'Emergency: stop all agents + clear queue'],
+  ['/stop', "Stop this chat's task + the agents it started (a full stop when nothing else runs)"],
+  ['/reset', 'Full reset: stop all + clear context (requires confirmation)'],
+  ['/spotify', 'Show Spotify connection status'],
+  ['/spotify auth', 'Connect Spotify (browser or manual code flow)'],
+  ['/spotify code <code>', 'Complete auth with a pasted authorization code (for SSH/Telegram)'],
+  ['/spotify player', 'Interactive music player (CLI only: arrow-key controls, search, queue)'],
+  ['/spotify devices', 'List available Spotify devices'],
+  ['/spotify device <id>', 'Set active Spotify device'],
+  ['/spotify now', 'Show what is currently playing'],
+  ['/spotify logout', 'Disconnect Spotify and clear saved tokens'],
+  ['/unpair', 'Reset all Telegram access for this Mercury instance (admins only)'],
+];
+
 export function getManual(): string {
   const sections: string[] = [];
 
@@ -93,6 +282,10 @@ export function getManual(): string {
     ['mercury service install', 'Install as system service (auto-start)'],
     ['mercury service uninstall', 'Uninstall system service'],
     ['mercury service status', 'Show system service status'],
+    ['mercury code', 'Open the Mercury Code TUI here (fresh session)'],
+    ['mercury code <dir>', 'Open Mercury Code in <dir>'],
+    ['mercury uninstall', 'Fully remove Mercury (runtime, service, npm/binary artifacts)'],
+    ['mercury uninstall --purge-data', 'Also delete all Mercury data (~/.mercury)'],
     ['mercury --verbose', 'Start with debug logging on stderr'],
   ];
 
@@ -105,98 +298,32 @@ export function getManual(): string {
   sections.push(chalk.dim('  Type these during a conversation (no API calls).'));
   sections.push('');
 
-  const chat = [
-    ['/start', 'Start Telegram pairing or request Telegram access'],
-    ['/pair', 'Start Telegram pairing or request Telegram access'],
-    ['/', 'Open the CLI command picker with arrow-key navigation'],
-    ['/menu', 'Open the CLI command picker with arrow-key navigation'],
-    ['/help', 'Show this manual'],
-    ['/status', 'Show config and budget info'],
-    ['/sessions', 'List active canonical sessions'],
-    ['/session new', 'Create and switch to a new session'],
-    ['/session <ref>', 'Switch by UUID/prefix/alias'],
-    ['/session current', 'Show the current session'],
-    ['/session archive <ref>', 'Archive a session'],
-    ['/session delete <ref>', 'Permanently delete a session after confirmation'],
-    ['/progress', 'Show live status for the current long task'],
-    ['/telegram', 'CLI chat only: open the Telegram management menu'],
-    ['/telegram pending', 'CLI chat only: list pending Telegram requests'],
-    ['/telegram users', 'CLI chat only: list approved Telegram users'],
-    ['/telegram approve <code|id>', 'CLI chat only: approve the first pairing code or a later request'],
-    ['/telegram reject <id>', 'CLI chat only: reject a pending Telegram request'],
-    ['/telegram remove <id>', 'CLI chat only: remove an approved Telegram user'],
-    ['/telegram promote <id>', 'CLI chat only: promote a Telegram member to admin'],
-    ['/telegram demote <id>', 'CLI chat only: demote a Telegram admin to member'],
-    ['/telegram reset', 'CLI chat only: reset all Telegram access'],
-    ['/tools', 'List currently loaded tools'],
-    ['/skills', 'List installed skills'],
-    ['/skills search <query>', 'Search skills.mercuryagent.sh'],
-    ['/skills view <id>', 'Show details + registry URL for a skill'],
-    ['/skills install <id|url>', 'Install from the registry or a raw SKILL.md URL'],
-    ['/skills remove <id>', 'Uninstall a skill'],
-    ['/permissions', 'Change permission mode (Ask Me / Allow All)'],
-    ['/view', 'Toggle progress view (balanced/detailed)'],
-    ['/view balanced', 'Set compact progress view'],
-    ['/view detailed', 'Set full progress view'],
-    ['/tasks', 'List scheduled tasks'],
-    ['/memory', 'View and manage second brain memory'],
-    ['/stream', 'Toggle text streaming on/off (Telegram)'],
-    ['/stream on', 'Enable streaming (live text updates)'],
-    ['/stream off', 'Disable streaming (single message)'],
-    ['/saver', 'Show Token Saver Mode status and tokens saved'],
-    ['/saver on', 'Manually enable Token Saver Mode (terser, faster, cheaper)'],
-    ['/saver off', 'Disable Token Saver Mode'],
-    ['/saver toggle', 'Toggle Token Saver Mode on/off'],
-    ['/saver threshold <0-100>', 'Auto-engage threshold (default 75%; 0 to disable)'],
-    ['/saver auto on|off', 'Enable/disable automatic engagement at threshold'],
-    ['/saver routing on|off', 'Prefer cheap providers when saver is active (opt-in)'],
-    ['/agents', 'List all sub-agents and their status'],
-    ['/agents stop <id|all>', 'Stop a sub-agent or all sub-agents'],
-    ['/agents pause <id>', 'Pause a running sub-agent'],
-    ['/agents resume <id>', 'Resume a paused sub-agent'],
-    ['/agents config', 'Show sub-agent resource allocation'],
-    ['/agents set max <n>', 'Set max concurrent sub-agents'],
-    ['/code', 'Enter Mercury Code (full-screen coding TUI in current dir)'],
-    ['/code auto', 'Auto mode (default): plans and builds in one flow, confirms only large changes'],
-    ['/code plan', 'Switch to plan mode (analyze, present options, no coding)'],
-    ['/code execute', 'Switch to execute mode (implement plan step by step)'],
-    ['/code build', 'Alias of execute mode for build-focused coding'],
-    ['/code diff', 'Show the working-tree diff vs HEAD with syntax colors'],
-    ['/code init', 'Scan the repo and write/refresh AGENTS.md'],
-    ['/code workspace', 'Open current directory in workspace IDE mode'],
-    ['/code agent <task>', 'Delegate a coding task to a sub-agent in background'],
-    ['/code off', 'Exit programming mode (leaves Mercury Code screen)'],
-    ['/code exit', 'Leave Mercury Code (asks for confirmation)'],
-    ['/code chat', 'Switch back to regular chat instantly (alias: /code back)'],
-    ['/chat', 'Return to chat mode (tears down Mercury Code if active)'],
-    ['/code toggle', 'Cycle through: off → auto → plan → execute → off'],
-    ['/research', 'Show research mode status'],
-    ['/research on', 'Enable deep research mode (web research + rich markdown article)'],
-    ['/research off', 'Exit research mode'],
-    ['/research toggle', 'Toggle research mode on/off'],
-    ['/research <topic>', 'Enable research mode for a specific topic'],
-    ['/ws exit', 'Exit workspace IDE mode back to general chat'],
-    ['/ws open <path>', 'Open a workspace directory in IDE mode'],
-    ['/ws refresh', 'Refresh file tree + git status panel'],
-    ['/ws stage <file|all>', 'Stage a file or all changes'],
-    ['/ws commit <message>', 'Commit staged changes (Mercury co-authored)'],
-    ['/ws undo <file>', 'Revert file changes with git checkout -- <file>'],
-    ['/halt', 'Emergency: stop all agents + clear queue'],
-    ['/stop', 'Stop all agents + clear queue + release locks + clear task board'],
-    ['/reset', 'Full reset: stop all + clear context (requires confirmation)'],
-    ['/spotify', 'Show Spotify connection status'],
-    ['/spotify auth', 'Connect Spotify (browser or manual code flow)'],
-    ['/spotify code <code>', 'Complete auth with a pasted authorization code (for SSH/Telegram)'],
-    ['/spotify player', 'Interactive music player (CLI only: arrow-key controls, search, queue)'],
-    ['/spotify devices', 'List available Spotify devices'],
-    ['/spotify device <id>', 'Set active Spotify device'],
-    ['/spotify now', 'Show what is currently playing'],
-    ['/spotify logout', 'Disconnect Spotify and clear saved tokens'],
-    ['/unpair', 'Reset all Telegram access for this Mercury instance (admins only)'],
-  ];
+  const chat = CHAT_COMMAND_HELP;
 
   for (const [cmd, desc] of chat) {
     sections.push(`  ${chalk.white(cmd.padEnd(16))} ${desc}`);
+  }
+
+  sections.push('');
+  sections.push(chalk.bold.white('  Terminal UI keys'));
+  sections.push('');
+
+  const keys = [
+    ['Esc', 'Interrupt the running turn (same as /stop). When idle: Esc Esc leaves Mercury Code; Esc leaves the coding/workspace view'],
+    ['Ctrl+C', 'Clear the input. On an empty input, press twice within 1.5 s to exit — one tap never quits'],
+    ['Enter', 'Send. A paste never sends: multi-line pastes land as multi-line text'],
+    ['Shift+Enter / Ctrl+N', 'Insert a newline'],
+    ['← → / Alt+← Alt+→', 'Move by character / by word (Ctrl+←/→ and Alt+B/F too)'],
+    ['Home / End', 'Start / end of the line (Ctrl+A / Ctrl+E)'],
+    ['Backspace / Delete', 'Delete before / under the cursor (emoji and CJK stay whole)'],
+    ['Ctrl+W / Ctrl+U / Ctrl+K', 'Delete the previous word / to line start / to line end'],
+    ['↑ ↓', 'Input history (persisted in ~/.mercury/history) or move in a suggestion list'],
+    ['Tab', 'Complete the highlighted / # suggestion'],
+    ['Ctrl+S', 'Mercury Code: freeze the screen to scroll and copy; Ctrl+S resumes'],
+  ];
+
+  for (const [key, desc] of keys) {
+    sections.push(`  ${chalk.white(key.padEnd(26))} ${desc}`);
   }
 
   sections.push('');
@@ -206,10 +333,10 @@ export function getManual(): string {
   const perms = [
     'Commands are blocked (never run), auto-approved, or need approval.',
     'Use interactive approval prompts: ↑/↓ + Enter (or Y/N/A shortcuts).',
-    'Choose "Always" when prompted to permanently approve a command type.',
+    'Choose "Always" on a command prompt to allow that command (e.g. every `pandoc …`) for the rest of the chat. Installs stay one at a time.',
     'Edit ~/.mercury/permissions.yaml to customize manually.',
     'File access is scoped — new paths need approval (Yes/No/Always).',
-    'At session start, choose "Ask Me" (confirm each action) or "Allow All" (auto-approve everything).',
+    'Choose "Ask Me" (confirm risky actions) or "Allow All" once, at setup; Mercury remembers it. Change it any time with /permissions (or /permissions allow-all | ask-me).',
     'Scheduled tasks always run in Allow All mode.',
   ];
 
@@ -255,6 +382,7 @@ export function getManual(): string {
     ['~/.mercury/permissions.yaml', 'Capabilities and approval rules'],
     ['~/.mercury/soul/*.md', 'Agent personality (soul, persona, taste, heartbeat)'],
     ['~/.mercury/skills/', 'Installed skills'],
+    ['~/.mercury/plugins/', 'Installed plugins, their data and settings'],
     ['~/.mercury/schedules.yaml', 'Scheduled tasks'],
     ['~/.mercury/token-usage.json', 'Daily token usage tracking'],
     ['~/.mercury/memory/', 'Short-term, long-term, episodic memory'],
@@ -285,10 +413,34 @@ export function getTelegramHelp(): string {
   lines.push('/help — Show this command list');
   lines.push('/status — Config, budget, and uptime');
   lines.push('/progress — Live status for the current task');
+  lines.push('/log — Step log of the last finished task');
+  lines.push('/whatsnew — What changed in this Mercury version');
+  lines.push('/update ignore — Silence the offered update notice');
   lines.push('/permissions — Switch Ask Me / Allow All mode');
-  lines.push('/models — List providers or switch AI model');
+  lines.push('/models — List providers or switch AI model (saved across restarts)');
+  lines.push('/image <prompt> — Make an image with an image model');
+  lines.push('/media — Image model in use; /media image <n> to change it');
+  lines.push('/say <text> — Say it out loud (a voice note in chat apps)');
+  lines.push('/video <shot>, /music <style> — Make a video or song; it arrives when ready');
+  lines.push('/effort — Show or set how hard the current model thinks');
   lines.push('/cloud models — List Mercury Cloud models and switch');
   lines.push('/stream — Toggle text streaming on/off');
+  lines.push("/stop — Stop this chat's task, its agents and waiting messages now (other chats keep going)");
+  lines.push("/halt — Emergency: stop every chat's task and all agents");
+  lines.push('');
+
+  lines.push('**Tasks**');
+  lines.push('/bg — Show background tasks and current task status');
+  lines.push('/bg current — Move the current task to the background (keeps running)');
+  lines.push('/bg list — List background tasks');
+  lines.push('/bg cancel <id> — Cancel a background task');
+  lines.push('');
+
+  lines.push('**Plugins**');
+  lines.push('/plugins — Installed and available plugins, with buttons');
+  lines.push('/plugins install <id> — Install (shows what it needs first)');
+  lines.push('/plugins enable|disable <id> — Turn a plugin on or off');
+  lines.push('/plugins uninstall <id> — Remove (keeps data unless --purge)');
   lines.push('');
 
   lines.push('**Budget**');
@@ -318,11 +470,14 @@ export function getTelegramHelp(): string {
   lines.push('');
 
   lines.push('**Research Mode**');
-  lines.push('/research — Show current research mode status');
-  lines.push('/research on — Enable deep web research + rich markdown article');
-  lines.push('/research off — Exit research mode');
-  lines.push('/research toggle — Toggle research mode');
-  lines.push('/research <topic> — Enable research mode for a specific topic');
+  lines.push('/research — Show research status');
+  lines.push('/research on — Research your next message (live sources, full report), then switch off');
+  lines.push('/research off — Cancel research for your next message');
+  lines.push('/research toggle — Switch research on/off for your next message');
+  lines.push('/research <topic> — Research a topic now');
+  lines.push('/research plan <topic> — Show the plan first; edit it, then start');
+  lines.push('/research continue — Continue the last research, filling its gaps');
+  lines.push("/research retry — Retry the sources the last research couldn't read");
   lines.push('');
 
   lines.push('**Sub-Agents**');
@@ -330,8 +485,8 @@ export function getTelegramHelp(): string {
   lines.push('/agents stop <id|all> — Stop a sub-agent');
   lines.push('/agents pause <id> — Pause a sub-agent');
   lines.push('/agents resume <id> — Resume a sub-agent');
-  lines.push('/halt — Emergency: stop all agents + clear queue');
-  lines.push('/stop — Stop all + release locks + clear task board');
+  lines.push("/halt — Emergency: stop every chat's task + all agents");
+  lines.push("/stop — Stop this chat's task + its agents (full stop + release locks when nothing else runs)");
   lines.push('/reset — Full reset (stop all + clear context)');
   lines.push('');
 
@@ -381,9 +536,33 @@ export function getDiscordHelp(): string {
   lines.push('/help \u2014 Show this command list');
   lines.push('/status \u2014 Config, budget, and uptime');
   lines.push('/progress \u2014 Live status for the current task');
+  lines.push('/log \u2014 Step log of the last finished task');
+  lines.push('/whatsnew \u2014 What changed in this Mercury version');
+  lines.push('/update ignore \u2014 Silence the offered update notice');
   lines.push('/permissions \u2014 Switch Ask Me / Allow All mode');
-  lines.push('/models \u2014 List providers or switch AI model');
+  lines.push('/models \u2014 List providers or switch AI model (saved across restarts)');
+  lines.push('/image <prompt> \u2014 Make an image with an image model');
+  lines.push('/media \u2014 Image model in use; /media image <n> to change it');
+  lines.push('/say <text> \u2014 Say it out loud (a voice note in chat apps)');
+  lines.push('/video <shot>, /music <style> \u2014 Make a video or song; it arrives when ready');
+  lines.push('/effort \u2014 Show or set how hard the current model thinks');
   lines.push('/cloud models \u2014 List Mercury Cloud models and switch');
+  lines.push('/stop \u2014 Stop the current task and its agents now');
+  lines.push('/halt \u2014 Emergency: stop all agents and clear the queue');
+  lines.push('');
+
+  lines.push('**Tasks**');
+  lines.push('/bg \u2014 Show background tasks and current task status');
+  lines.push('/bg current \u2014 Move the current task to the background (keeps running)');
+  lines.push('/bg list \u2014 List background tasks');
+  lines.push('/bg cancel <id> \u2014 Cancel a background task');
+  lines.push('');
+
+  lines.push('**Plugins**');
+  lines.push('/plugins \u2014 Installed and available plugins');
+  lines.push('/plugins install <id> \u2014 Install (shows what it needs first)');
+  lines.push('/plugins enable|disable <id> \u2014 Turn a plugin on or off');
+  lines.push('/plugins uninstall <id> \u2014 Remove (keeps data unless --purge)');
   lines.push('');
 
   lines.push('**Budget**');
@@ -420,7 +599,12 @@ export function getSlackHelp(): string {
   lines.push('**General**');
   lines.push('/mercury help \u2014 Show this command list');
   lines.push('/mercury status \u2014 Config, budget, and uptime');
-  lines.push('/mercury stop \u2014 Stop all agents');
+  lines.push('/mercury progress \u2014 Live status for the current task');
+  lines.push('/mercury log \u2014 Step log of the last finished task');
+  lines.push('/mercury whatsnew \u2014 What changed in this Mercury version');
+  lines.push('/mercury update ignore \u2014 Silence the offered update notice');
+  lines.push('/mercury models \u2014 List providers or switch AI model');
+  lines.push('/mercury stop \u2014 Stop the current task and its agents now');
   lines.push('');
 
   lines.push('**Budget**');

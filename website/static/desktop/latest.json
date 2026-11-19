@@ -1,0 +1,51 @@
+{
+  "version": "1.5.4",
+  "notes": "## ☿ Mercury Agent v1.5.4\n\nSet up voice from your phone, and fewer approval prompts.\n\n### Voice from any device\n- **Set voice keys from your phone**, with or without Optimus: OpenAI, Gemini, ElevenLabs, Deepgram and more. Mercury checks each key before saving it. A key is never shown back to a device, only its last four characters.\n- **One place for keys.** A key saved from the phone, Mercury Desktop or Optimus is the same key everywhere.\n\n### Fewer prompts\n- **Only plugin installs ask from another device.** Changing a plugin's settings, like Optimus's voice, and setting voice keys no longer ask for your approval. Both are still recorded in the audit log.\n\n### Fixes\n- **A setting changed from a phone no longer snaps back** when the plugin takes a while to restart.\n\n### Install\n- **Desktop:** [mercuryagent.sh/download](https://mercuryagent.sh/download) · Mac: `curl -fsSL https://mercuryagent.sh/install-desktop.sh | sh`\n- **Server / CLI:** `curl -fsSL https://mercuryagent.sh/install.sh | sh` · Windows: `irm https://mercuryagent.sh/install.ps1 | iex` · npm: `npm i -g @cosmicstack/mercury-agent`\n- **Already installed:** the Update button in Mercury Desktop, or `mercury upgrade`\n",
+  "pub_date": "2026-11-17T10:58:07.219Z",
+  "platforms": {
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNjFDbk9jbEtpLzd2ZlFVRjFwYzE4ZlUrb3p2aDF4blFRdkxaRVV6anZLMzdpQnNJNlhkUGxSNllOMTlRSWVMOWVYdjNPdEdEVWdzUHNENGNjYkYzV1FnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEyOTU2CWZpbGU6TWVyY3VyeV8xLjUuNF9hbWQ2NC5BcHBJbWFnZQl2ZXJzaW9uOjEuNS40CndzVEw2YUQ4TmtBblUzZ0ZiMkgxVk5uWDQwcVpmQjVtRkdIeU1PWm56VktGL1NuYXl6OW01aXRQckFVZnFNNU00ZnhzOFU4bEcvakxGZTN2OHE1OUFBPT0K",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_1.5.4_amd64.AppImage"
+    },
+    "linux-x86_64-appimage": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNjFDbk9jbEtpLzd2ZlFVRjFwYzE4ZlUrb3p2aDF4blFRdkxaRVV6anZLMzdpQnNJNlhkUGxSNllOMTlRSWVMOWVYdjNPdEdEVWdzUHNENGNjYkYzV1FnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEyOTU2CWZpbGU6TWVyY3VyeV8xLjUuNF9hbWQ2NC5BcHBJbWFnZQl2ZXJzaW9uOjEuNS40CndzVEw2YUQ4TmtBblUzZ0ZiMkgxVk5uWDQwcVpmQjVtRkdIeU1PWm56VktGL1NuYXl6OW01aXRQckFVZnFNNU00ZnhzOFU4bEcvakxGZTN2OHE1OUFBPT0K",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_1.5.4_amd64.AppImage"
+    },
+    "linux-x86_64-deb": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNjFpOGxIMFZ5WGJNc1ZjWGtpeE9ndFQ3YkNuQk5ZTWJ4TXRaWXhBVmN2T3BOdVN1TWFBNFgvVDZ6K0trWHBWMm1UWmVTTVozRVJhdzdQdGVSM0d4SUFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEyOTU2CWZpbGU6TWVyY3VyeV8xLjUuNF9hbWQ2NC5kZWIJdmVyc2lvbjoxLjUuNAoyeklSMC9MbndGNERuWUhTaGlFWjBnMFlBYzZldlZQdzI3cjN3Y0JJVDJUZ3JQcmd3Um1YbnY0WDJwUElQbGplNlNjSDBqcWlWSXJMUTRnOGVtbXdBZz09Cg==",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_1.5.4_amd64.deb"
+    },
+    "linux-x86_64-rpm": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNjJsQmpqK0pTcVNzV1A3eVdmNzVlWEYvYWJkY0hjS1A5SU1ZK0NzTXYrb2w5b20veElkSmdIcDI4UDMwMkFiNVRnZHBML1Zra1UzNUFaN3B4cWZZY3dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEyOTU2CWZpbGU6TWVyY3VyeS0xLjUuNC0xLng4Nl82NC5ycG0JdmVyc2lvbjoxLjUuNApwZ3VENXpnZHpadE5YN2syTDRqU3dadmhXMG9BRDBCUXBTRHIxa09ZS0NpZEU1V2liWGVncjFaRzJWVGUvRFg1SG8wNEEwVExocUE2eTZ0SkUvNytDQT09Cg==",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury-1.5.4-1.x86_64.rpm"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNjV1RVpMc0FRYk9aaUMxV1lKd2g2bmVJY3htU0pJMTR0ZEloczErR1FMUGxmVEN0aVduVGlDd1hEaDJ3Y1ZPc25zenA1enkzcWpoQnhMWDlsNC9ERGdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEyOTc0CWZpbGU6TWVyY3VyeV8xLjUuNF94NjQtc2V0dXAuZXhlCXZlcnNpb246MS41LjQKSDVZSHVZRmtKeHRuSEV1NUZnUHZjd0dhQVhKYzJUNzZQc2hwZVFoUnlEdlduelZrVGcyUFN5bWZXN0tnd2loaHJHR1U3RnJva3lFNzd0c2tYZ1lxQ2c9PQo=",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_1.5.4_x64-setup.exe"
+    },
+    "windows-x86_64-nsis": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNjV1RVpMc0FRYk9aaUMxV1lKd2g2bmVJY3htU0pJMTR0ZEloczErR1FMUGxmVEN0aVduVGlDd1hEaDJ3Y1ZPc25zenA1enkzcWpoQnhMWDlsNC9ERGdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEyOTc0CWZpbGU6TWVyY3VyeV8xLjUuNF94NjQtc2V0dXAuZXhlCXZlcnNpb246MS41LjQKSDVZSHVZRmtKeHRuSEV1NUZnUHZjd0dhQVhKYzJUNzZQc2hwZVFoUnlEdlduelZrVGcyUFN5bWZXN0tnd2loaHJHR1U3RnJva3lFNzd0c2tYZ1lxQ2c9PQo=",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_1.5.4_x64-setup.exe"
+    },
+    "windows-x86_64-msi": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNnhNSkNmTUFYNDU3Z3NGWklRRFIzZDFTOUt5TXF4SmlDS0VaZzhGSnNvK21pYXBjd1JWSVZmbXc5VVBOdFAzVHM0eUVjRTRKVlBNRVNuM3VNTGdZWEFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEyOTc0CWZpbGU6TWVyY3VyeV8xLjUuNF94NjRfZW4tVVMubXNpCXZlcnNpb246MS41LjQKQlByY3ZOb2k3anQrZlRPbDNCeFdvMzQyVmlMeUllRnpGdEhLM0ZKMjhremFneFk5WXlNVFdENGhwdnRTYWtZeVB6OCtSTStETnJKTU10UU5PT3ZoQWc9PQo=",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_1.5.4_x64_en-US.msi"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNjNPbFU4amdIUGVHWWxYR0N2SFJvajRYSFlLNGNOcmsyK3lUeHZCZ1NxNjhIcHIrTm1lT01sNDR1WEFBZ3JscWRHN2ZhNnpsUC9uRWF1bjgza1prNFFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEzMDI3CWZpbGU6TWVyY3VyeS5hcHAudGFyLmd6CXZlcnNpb246MS41LjQKRXJFbHREZDE1QmZ3bVpEZmM3VFljb2tNMnhmenltUnlNUkVXd3VSUGkwcXdPbWt0RVA4ejB2ZnRJUnVvaWRwWWFNWm10NVNHRWNLeFNwOFNKaDRJRHc9PQo=",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_x64.app.tar.gz"
+    },
+    "darwin-x86_64-app": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNjNPbFU4amdIUGVHWWxYR0N2SFJvajRYSFlLNGNOcmsyK3lUeHZCZ1NxNjhIcHIrTm1lT01sNDR1WEFBZ3JscWRHN2ZhNnpsUC9uRWF1bjgza1prNFFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEzMDI3CWZpbGU6TWVyY3VyeS5hcHAudGFyLmd6CXZlcnNpb246MS41LjQKRXJFbHREZDE1QmZ3bVpEZmM3VFljb2tNMnhmenltUnlNUkVXd3VSUGkwcXdPbWt0RVA4ejB2ZnRJUnVvaWRwWWFNWm10NVNHRWNLeFNwOFNKaDRJRHc9PQo=",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_x64.app.tar.gz"
+    },
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNisvLzFMeVozeDIzRHJxMU1TbzBQYWk1dnBQR0dTanlaejBCdDhjbE96ZkI4M2RTS21HMldjWVZKSFRMM0tkQkx6bVgzUTB5T3I4U0xINlhYaThldUFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEzMDgzCWZpbGU6TWVyY3VyeS5hcHAudGFyLmd6CXZlcnNpb246MS41LjQKamVKK2RaVnFEN2pvWk1ZdlZPRkJGd0pQMkxwcjJ0eE90d08yenZHektkdGpDcnc0VDJFNnRGVXR5cEl4T1FaT1M4UDF5dGFybGZMU3RGcHBqSXVNRFE9PQo=",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_aarch64.app.tar.gz"
+    },
+    "darwin-aarch64-app": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUV2VUTlRLNTFvNisvLzFMeVozeDIzRHJxMU1TbzBQYWk1dnBQR0dTanlaejBCdDhjbE96ZkI4M2RTS21HMldjWVZKSFRMM0tkQkx6bVgzUTB5T3I4U0xINlhYaThldUFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0OTEzMDgzCWZpbGU6TWVyY3VyeS5hcHAudGFyLmd6CXZlcnNpb246MS41LjQKamVKK2RaVnFEN2pvWk1ZdlZPRkJGd0pQMkxwcjJ0eE90d08yenZHektkdGpDcnc0VDJFNnRGVXR5cEl4T1FaT1M4UDF5dGFybGZMU3RGcHBqSXVNRFE9PQo=",
+      "url": "https://github.com/cosmicstack-labs/mercury-agent/releases/latest/download/Mercury_aarch64.app.tar.gz"
+    }
+  }
+}

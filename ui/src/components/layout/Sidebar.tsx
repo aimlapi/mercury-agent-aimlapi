@@ -1,5 +1,6 @@
 import { NavLink, useLocation } from "react-router-dom";
 import { cn } from "@/lib/utils";
+import api from "@/lib/api";
 import { useThemeStore } from "@/stores/theme";
 import { ThemeToggle } from "./ThemeToggle";
 import {
@@ -14,7 +15,10 @@ import {
   Share2,
   
   Cpu,
+  Bot,
   Puzzle,
+  Plug,
+  Blocks,
   Shield,
   Clock,
   BarChart3,
@@ -42,6 +46,7 @@ const NAV_SECTIONS = [
     items: [
       { to: "/", icon: LayoutDashboard, label: "Status" },
       { to: "/chat", icon: MessageSquare, label: "Chat" },
+      { to: "/bots", icon: Bot, label: "Bots" },
       { to: "/tasks", icon: ListTodo, label: "Tasks" },
       { to: "/board", icon: Kanban, label: "Board" },
       { to: "/workspace", icon: Code2, label: "Workspace" },
@@ -61,6 +66,8 @@ const NAV_SECTIONS = [
     items: [
       { to: "/providers", icon: Cpu, label: "Providers" },
       { to: "/skills", icon: Puzzle, label: "Skills" },
+      { to: "/mcp", icon: Plug, label: "MCP" },
+      { to: "/plugins", icon: Blocks, label: "Plugins" },
       { to: "/permissions", icon: Shield, label: "Permissions" },
       { to: "/schedules", icon: Clock, label: "Schedules" },
       { to: "/usage", icon: BarChart3, label: "Usage" },
@@ -240,7 +247,7 @@ export function Sidebar({ open, onToggle }: SidebarProps) {
             {(() => {
               const btn = (
                 <button
-                  onClick={() => { window.location.href = "/api/auth/logout"; }}
+                  onClick={() => { void api.auth.signOut(); }}
                   className="p-2 rounded-lg text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
                 >
                   <LogOut size={18} />

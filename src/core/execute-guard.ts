@@ -80,6 +80,20 @@ const PURE_CONVERSATION_PATTERN = /^(thanks|thank you|thx|ty|cool|nice|great|awe
 /** Interrogatives: the user wants an answer, not (necessarily) file changes. */
 const QUESTION_PATTERN = /^(what|whats|what's|why|how|when|where|who|which|explain|describe|tell me|walk me through|compare|list)\b/i;
 
+/**
+ * Text-deliverable writing: in plain chat the response itself IS the
+ * deliverable — a poem, an email, an essay. No tool work is required to
+ * fulfill these, so the narration guard must not force the model through
+ * file tools for them. Repo/code-shaped requests ("fix the login bug",
+ * "build a dashboard") never match this pattern and stay guarded.
+ */
+const TEXT_DELIVERABLE_PATTERN =
+  /\b(poems?|poetry|haiku|stor(y|ies)|essay|essays|lyrics|song|joke|jokes|slogans?|taglines?|e-?mails?|letters?|blog|blogs|articles?|summaries|summari[sz]e|translat\w*|captions?|tweets?|outlines?|brainstorm|names?|titles?|description|descriptions)\b/i;
+
+export function isTextDeliverableRequest(taskText: string): boolean {
+  return TEXT_DELIVERABLE_PATTERN.test(taskText);
+}
+
 export interface ExecuteGuardInput {
   /** The user's request for this turn. */
   taskText: string;
@@ -173,6 +187,28 @@ export interface VerificationInput {
   commandsRun: Iterable<string>;
   /** Tool name → whether at least one invocation produced a non-error result. */
   toolsSucceeded?: ReadonlyMap<string, boolean>;
+  /**
+   * Whether the most recent verification command actually passed AND ran
+   * after the last successful mutation. When provided, this replaces the
+   * command-string heuristic: a failing or timed-out `npm test` is not
+   * evidence, and neither is a test that ran before the latest edits.
+   */
+  verifiedOk?: boolean;
+}
+
+/**
+ * Did a verification command's output indicate success? Conservative: any
+ * non-zero exit, explicit failure, timeout, or kill reads as NOT ok. The
+ * run_command tool formats these outcomes as "Command exited with code N",
+ * "⏱ Command timed out after Ns", or an "Error:" prefix.
+ */
+export function isVerificationOutputOk(resultText: string): boolean {
+  if (!resultText || !resultText.trim()) return false;
+  const head = resultText.slice(0, 400);
+  if (/timed out|ETIMEDOUT|SIGKILL|SIGTERM|was killed/i.test(head)) return false;
+  if (/exited with code|command failed|^\s*Error:/im.test(head)) return false;
+  if (/\berror:/i.test(head)) return false;
+  return true;
 }
 
 /**
@@ -186,8 +222,15 @@ export function shouldRequireVerification(input: VerificationInput): boolean {
   const mutated = [...(input.toolsSucceeded?.entries() ?? [])]
     .some(([tool, ok]) => EXECUTE_MUTATING_TOOLS.has(tool) && ok === true);
   if (!mutated) return false;
-  for (const command of input.commandsRun) {
-    if (VERIFICATION_COMMAND_PATTERN.test(command)) return false;
+  if (input.verifiedOk !== undefined) {
+    // Evidence-aware path: only a clean verification after the last edit
+    // releases the gate.
+    if (input.verifiedOk) return false;
+  } else {
+    // Legacy heuristic for callers that do not track results.
+    for (const command of input.commandsRun) {
+      if (VERIFICATION_COMMAND_PATTERN.test(command)) return false;
+    }
   }
   const task = input.taskText.trim();
   if (task.length < 2) return false;
@@ -225,4 +268,28 @@ export function wakeUpPrompt(taskHint?: string): string {
     task,
     'Your very next response MUST begin with a mutating tool call — create_file, write_file, edit_file, or run_command. ZERO prose before the call. Pick the smallest real piece of the task (even scaffolding or a stub) and DO it. Only after the call lands may you write text.',
   ].join(' ');
+}
+
+/** Tools whose success means a chat turn produced something worth checking. */
+const CHAT_DELIVERABLE_TOOLS: ReadonlySet<string> = new Set(['create_file', 'write_file', 'edit_file', 'run_command', 'send_file']);
+
+/** A planned chat turn made something (a file, a render, a sent file): check it before calling it done. */
+export function chatNeedsCheck(toolsSucceeded: ReadonlyMap<string, boolean>): boolean {
+  return [...toolsSucceeded].some(([tool, ok]) => ok && CHAT_DELIVERABLE_TOOLS.has(tool));
+}
+
+/**
+ * The chat version of the verification round: not "run the tests" but "look
+ * at what you made". It exists because a chat could make a black MP4 with
+ * ffmpeg, send it, and announce "Video created & sent! pixel-perfect".
+ */
+export function chatCheckPrompt(taskHint?: string): string {
+  const hint = taskHint?.trim();
+  return [
+    '[SYSTEM: CHECK BEFORE DONE] Before you tell the user this is finished, look at what you actually produced.',
+    hint ? `The request: "${hint.slice(0, 200)}".` : '',
+    'For each deliverable: confirm it exists and is what was asked — open or read the file, probe a video (e.g. ffprobe, or extract a frame and look), check a page renders, check sizes and durations.',
+    'If it is wrong or incomplete, fix it now. If you could not do what was asked the way it was asked (a tool failed, a requirement is missing), say so plainly and what is needed — do not present a workaround or a different method as the result.',
+    'Then reply with only what you verified.',
+  ].filter(Boolean).join(' ');
 }

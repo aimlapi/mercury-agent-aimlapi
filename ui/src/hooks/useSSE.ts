@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { useChatStore } from "@/stores/chat";
+import { createEventStream, type EventStream } from "@/lib/sse";
 
 interface SSEResult {
   connected: boolean;
@@ -9,7 +10,7 @@ interface SSEResult {
 export function useSSE(): SSEResult {
   const [connected, setConnected] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<EventStream | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const store = useChatStore;
@@ -21,7 +22,7 @@ export function useSSE(): SSEResult {
     }
 
     const query = activeSessionId ? `?sessionId=${encodeURIComponent(activeSessionId)}` : "";
-    const es = new EventSource(`/api/chat/events${query}`);
+    const es = createEventStream(`/api/chat/events${query}`);
     esRef.current = es;
 
     es.onopen = () => {
@@ -112,6 +113,20 @@ export function useSSE(): SSEResult {
         store.getState().setWaiting(false);
         store.getState().resetSteps();
       }
+    });
+
+    // A note while the turn keeps working ("Checking my work…"): shown, but the turn goes on.
+    es.addEventListener("progress", (e) => {
+      try {
+        const data = JSON.parse((e as MessageEvent).data);
+        if (typeof data.text !== "string" || !data.text.trim()) return;
+        store.getState().addMessage({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: data.text,
+          timestamp: new Date().toISOString(),
+        });
+      } catch { /* ignore */ }
     });
 
     es.addEventListener("permission_request", (e) => {

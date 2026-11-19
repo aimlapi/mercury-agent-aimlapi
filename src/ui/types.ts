@@ -2,6 +2,7 @@ import type { ProgrammingModeState } from '../core/programming-mode.js';
 import type { SaverModeState } from '../core/saver-mode.js';
 import type { SubAgentStatus } from '../types/agent.js';
 import type { PermissionMode } from '../channels/base.js';
+import type { ToolBlock } from './tool-block.js';
 
 export type AppMode = 'splash' | 'chat' | 'coding' | 'workspace' | 'spotify' | 'menu' | 'mercury-code';
 
@@ -78,6 +79,8 @@ export interface ChatMessage {
   streaming?: boolean;
   completionMeta?: CompletionMeta;
   fileChanges?: FileChangeSummary[];
+  /** A finished tool call (Mercury Code transcript block); content holds a plain-text fallback. */
+  tool?: ToolBlock;
 }
 
 export interface FileChangeSummary {
@@ -85,6 +88,11 @@ export interface FileChangeSummary {
   added: number | null;
   removed: number | null;
 }
+
+/** Max file paths listed in the end-of-task summary (banner summary line and
+ * transcript file rows alike) — the count line still shows the full number;
+ * the complete list lives in git. */
+export const TASK_SUMMARY_FILE_LIMIT = 5;
 
 export interface ToolStep {
   id: string;
@@ -197,9 +205,13 @@ export interface BackgroundTaskInfo {
 }
 
 export interface PermissionPromptState {
+  /** Prompt id — the key the channel resolves by. Set on every prompt the
+   * channel creates; optional only for hand-built view fixtures. */
+  id?: string;
   type: 'mode' | 'ask' | 'continue' | 'choice';
   message: string;
   options?: Array<{ value: string; label: string }>;
+  /** Settle THIS prompt (routes to the channel's resolver map). */
   resolve: (value: string | boolean) => void;
 }
 

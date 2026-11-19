@@ -35,11 +35,24 @@ const SECRET_PATTERNS: RegExp[] = [
   /\bAKIA[0-9A-Z]{16}\b/g,
   // Slack tokens
   /\bxox[bapr]-[A-Za-z0-9-]{10,}\b/g,
+  /\bya29\.[A-Za-z0-9._-]{20,}/g,
+  /\b1\/\/[A-Za-z0-9_-]{20,}/g,
+  /\bGOCSPX-[A-Za-z0-9_-]{20,}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
   // Bearer / authorization headers
   /\b(?:Bearer|token|authorization)\s+[:=]?\s*[A-Za-z0-9._~+/-]{24,}/gi,
   // Generic key=value secrets in config output
-  /\b(api[_-]?key|secret|password|access[_-]?token|refresh[_-]?token)\s*[:=]\s*["']?[A-Za-z0-9._~+/=-]{12,}/gi,
+  /\b(api[_-]?key|secret|access[_-]?token|refresh[_-]?token)\s*[:=]\s*["']?[A-Za-z0-9._~+/=-]{12,}/gi,
 ];
+
+// Masked whole: a password has no recognizable prefix worth keeping, and a short
+// one would be mostly shown by maskMatch. Covers yaml/env values and Basic headers.
+const FULL_MASK_PATTERNS: RegExp[] = [
+  /(?<=\bpassword\s*[:=]\s*["']?)[^\s"']+/gi,
+  /(?<=\bBasic\s+)[A-Za-z0-9+/]{8,}={0,2}/g,
+];
+
+const JSON_SECRET = /("(?:api[_-]?key|client[_-]?secret|secret|password|token|access[_-]?token|refresh[_-]?token|id[_-]?token|private[_-]?key)"\s*:\s*")((?:[^"\\]|\\.){8,})"/gi;
 
 /** Keep enough of the key to identify it, mask the rest. */
 function maskMatch(match: string): string {
@@ -47,13 +60,25 @@ function maskMatch(match: string): string {
   return `${match.slice(0, 4)}****${match.slice(-4)}`;
 }
 
+const registeredSecrets = new Set<string>();
+
+export function registerSecretValue(value: string): void {
+  if (typeof value === 'string' && value.length >= 8) registeredSecrets.add(value);
+}
+
 export function redactSecrets(text: string): string {
   if (!text) return text;
   let out = text;
+  for (const secret of registeredSecrets) {
+    if (out.includes(secret)) out = out.split(secret).join('****');
+  }
   for (const pattern of SECRET_PATTERNS) {
     out = out.replace(pattern, maskMatch);
   }
-  return out;
+  for (const pattern of FULL_MASK_PATTERNS) {
+    out = out.replace(pattern, '****');
+  }
+  return out.replace(JSON_SECRET, (_match, key: string, value: string) => `${key}${/password/i.test(key) ? '****' : maskMatch(value)}"`);
 }
 
 /**
@@ -79,6 +104,11 @@ export function userFacingAiError(error: unknown): string {
   const normalized = message.toLowerCase();
   if (/context(?:_|\s|-)?length|too many tokens|maximum context|request too large|payload too large/.test(normalized)) {
     return 'This request is too large for the selected model. Shorten the conversation or choose another model.';
+  }
+  // Before the rate-limit rule: a budget refusal is our own decision, not the provider's, and
+  // "please try again shortly" is exactly wrong advice — a ceiling does not lift by itself.
+  if (/daily token budget|token budget|budget (?:exhausted|exceeded)|exceeded (?:my|its) (?:daily )?budget/.test(normalized)) {
+    return 'Mercury has used its whole daily token budget, so it stopped answering. Raise the budget, or wait for the daily reset.';
   }
   if (/rate.?limit|too many requests|quota|capacity|overloaded|\b429\b/.test(normalized)) {
     return 'The selected model is temporarily busy. Please try again shortly.';

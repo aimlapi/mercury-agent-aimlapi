@@ -1,8 +1,16 @@
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, statSync, chmodSync } from 'node:fs';
+import { MediaJobs, setMediaJobs } from './media/jobs.js';
+import { mediaKeySources } from './media/key-sources.js';
+import { SpeechService, setSpeechService } from './media/speech.js';
+import { MediaService } from './media/service.js';
+import { setMediaService } from './media/runtime.js';
+import { outputRoot } from './artifacts/output-dir.js';
+import { createHash, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as pathResolve } from 'node:path';
 import { Command } from 'commander';
-import readline from 'node:readline';
+import { publishStatus, setStatusPublisher } from './core/provider-status.js';
+import { loadPermissionMode, savePermissionMode } from './capabilities/permission-mode-store.js';
 import chalk from 'chalk';
 
 import {
@@ -44,14 +52,27 @@ import {
   clearSlackAccess,
 } from './utils/config.js';
 import type { MercuryConfig } from './utils/config.js';
+import { autoTurnLimit, machineFacts, resolveTurnLimit } from './core/turn-governor.js';
 import type { ProviderName } from './utils/config.js';
 import { logger } from './utils/logger.js';
+import { devBuildLabel, isDevBuild } from './utils/dev-build.js';
 import { redactPhone } from './utils/redact.js';
 import { Identity } from './soul/identity.js';
 import { ShortTermMemory, LongTermMemory, EpisodicMemory, migrateLegacyMemory } from './memory/store.js';
 import { buildConversationHistoryPayload, CloudSessionSynchronizer, SessionRepository } from './sessions/index.js';
 import { UserMemoryStore } from './memory/user-memory.js';
-import { isBetterSqlite3Available } from './memory/second-brain-db.js';
+import { BotManager } from './bots/bot-manager.js';
+import { getPluginManager, peekPluginManager, setProviderLookup } from './plugins/manager.js';
+import { setCallLearning, setChannelHost, setDesktopActivityHook, setVoiceBriefing, setWorkProbe, setWorkStopper } from './plugins/channel-bridge.js';
+import { registerPluginsCli } from './cli/plugins-cli.js';
+import { PersonVerifier, personCheckPrompt, parsePersonCheck } from './memory/person-verifier.js';
+import { setPersonVerifier } from './web/api/brain.js';
+import { registerDevicesCli } from './cli/devices-cli.js';
+import { registerUpdateCli, runUpgrade } from './cli/upgrade-cli.js';
+import { registerServerCli } from './cli/server-cli.js';
+import { SECOND_BRAIN_UNAVAILABLE_MESSAGE } from './memory/second-brain-db.js';
+import { isSqliteAvailable } from './utils/sqlite-driver.js';
+import { runStorageDoctor } from './utils/storage-doctor.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { Agent } from './core/agent.js';
 import { Scheduler } from './core/scheduler.js';
@@ -61,30 +82,74 @@ import { SpotifyClient } from './spotify/client.js';
 import { ChannelRegistry } from './channels/registry.js';
 import { CLIChannel } from './channels/cli.js';
 import { TelegramChannel } from './channels/telegram.js';
+import type { Channel } from './channels/base.js';
 import { SignalChannel } from './channels/signal.js';
 import { DiscordChannel } from './channels/discord.js';
 import { WebChannel } from './channels/web.js';
 import { TokenBudget } from './utils/tokens.js';
+import { TITLE_SYSTEM_PROMPT, titlePrompt } from './sessions/title.js';
 import { CapabilityRegistry } from './capabilities/registry.js';
 import { SkillLoader } from './skills/loader.js';
 import { registerSkillsCommand } from './skills/cli.js';
+import { registerBotsCommand } from './bots/cli.js';
+import { registerGoogleCommand } from './google/cli.js';
 import { getManual } from './utils/manual.js';
+import { ask, InputClosedError } from './cli/ask.js';
 import { startBackground, stopDaemon, showLogs, getDaemonStatus, registerRuntimeProcess, releaseRuntimeProcess, restartDaemon, tryAutoDaemonize, isStandaloneBinary, getForegroundRuntimeStatus, stopForegroundRuntime } from './cli/daemon.js';
-import { installService, uninstallService, showServiceStatus, isServiceInstalled } from './cli/service.js';
+import { runUninstall } from './cli/uninstall.js';
+import { runAttach, type AttachResult } from './cli/attach.js';
+import { installService, uninstallService, showServiceStatus, isServiceInstalled, pinDaemonPathOnWindows, serviceDrift } from './cli/service.js';
+import { detectInkPatch, describeInkPatch, inkPatchFixCommand } from './ui/ink-patch-check.js';
 import { runWithWatchdog } from './cli/watchdog.js';
 import { setGitHubToken } from './utils/github.js';
 import { selectWithArrowKeys } from './utils/arrow-select.js';
 import { ProviderModelFetchError, fetchProviderModelCatalog } from './utils/provider-models.js';
+import { withBaseUrl } from './providers/basic-auth.js';
 import { initCloudTokenStore } from './cloud/token-store.js';
 import { clearCloudRuntimeOnline, markCloudRuntimeOnline } from './cloud/runtime-status.js';
-import { startWebServer, stopWebServer, updateStatus as updateWebStatus, setUserMemory as setWebUserMemory, setWebChannel as setWebWebChannel, setScheduler as setWebScheduler, setAgentSupervisor as setWebSupervisor, setBackgroundTaskManager as setWebBgTasks, setSpotifyClient as setWebSpotify, setProgrammingMode as setWebProgrammingMode, setModelSwitchCallback as setWebModelSwitch, setCurrentProviderCallback as setWebCurrentProvider, setKanbanSupervisor as setWebKanban, setKanbanBoardManager as setWebBoardManager, setKanbanProviders as setWebKanbanProviders, setIDEProviders as setWebIDEProviders, setSessionRepository as setWebSessions, setSessionSyncEnabledCallback as setWebSessionSyncEnabled } from './web/server.js';
-import { isWebAuthInitialized, setWebPassword } from './web/auth.js';
+import { setupPhoneReach, onBackgroundTaskDone, onBotInboxEntry } from './reach/wiring.js';
+import { startWebServer, stopWebServer, updateStatus as updateWebStatus, setUserMemory as setWebUserMemory, setWebChannel as setWebWebChannel, setScheduler as setWebScheduler, setAgentSupervisor as setWebSupervisor, setBackgroundTaskManager as setWebBgTasks, setSpotifyClient as setWebSpotify, setProgrammingMode as setWebProgrammingMode, setModelSwitchCallback as setWebModelSwitch, setCurrentProviderCallback as setWebCurrentProvider, setStatusSnapshotCallback as setWebStatusSnapshot, setKanbanSupervisor as setWebKanban, setKanbanBoardManager as setWebBoardManager, setKanbanProviders as setWebKanbanProviders, setIDEProviders as setWebIDEProviders, setSessionRepository as setWebSessions, setSessionSyncEnabledCallback as setWebSessionSyncEnabled, setBotManager as setWebBotManager, setBotsWebhookSecret, setShutdownHandler, setMcpManager as setWebMcpManager, setStopCallback as setWebStop, setSessionBusyLookup as setWebSessionBusy, setQueueControls as setWebQueueControls, setTurnControls as setWebTurnControls, setResearchControls as setWebResearchControls, setBudgetControls as setWebBudgetControls } from './web/server.js';
+import { validateApiKey, validateBaseUrl, validateModelName } from './providers/provider-meta.js';
+import { setFirstProviderHandler, setProvidersReload } from './web/api/providers.js';
+import { setCloudReload } from './web/api/cloud.js';
+import { spawnDetachedRestart } from './cli/daemon.js';
+import { recordVoiceCalls } from './plugins/voice-calls.js';
+import { setChannelRuntime } from './web/api/channels.js';
+import { setSkillBuilder } from './web/api/system.js';
+import { setArtifactOutputDir, setArtifactSessions } from './web/api/artifacts.js';
+import { setSuggestionEngine } from './web/api/suggestions.js';
+import { artifactStore } from './artifacts/store.js';
+import { isWebAuthInitialized, setWebPassword, writeAttachToken, initWebAuth } from './web/auth.js';
+import { startLoopLagMonitor } from './utils/loop-lag.js';
+import { McpManager, probeMcpServer, validateMcpConfig, type McpServerStatus } from './capabilities/mcp/index.js';
+import {
+  addServer as addMcpServer,
+  allowTools as allowMcpTools,
+  buildServerConfig as buildMcpServerConfig,
+  disallowTools as disallowMcpTools,
+  formatServerList as formatMcpServerList,
+  formatStatusLine as formatMcpStatusLine,
+  formatStdioCommand as formatMcpStdioCommand,
+  formatToolLines as formatMcpToolLines,
+  getServer as getMcpServer,
+  removeServer as removeMcpServer,
+  setServerEnabled as setMcpServerEnabled,
+} from './capabilities/mcp/admin.js';
+import { runMcpDoctor, summarizeMcpConfig } from './capabilities/mcp/doctor.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let pkgVersion: string;
 try {
-  // Normal (npm) install: package.json sits one level above dist/.
-  pkgVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
+  // Dev-channel builds are stamped at compile time (MERCURY_CHANNEL_VERSION →
+  // tsup define). This wins over whatever version happens to sit on disk —
+  // a dev binary run from a checkout must still report its dev stamp.
+  const channelVersion = (globalThis as any).__MERCURY_CHANNEL_VERSION__ as string | undefined;
+  if (channelVersion) {
+    pkgVersion = channelVersion;
+  } else {
+    // Normal (npm) install: package.json sits one level above dist/.
+    pkgVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
+  }
 } catch {
   // Standalone binary (Bun --compile / pkg / SEA): package.json is not on
   // disk next to the embedded bundle. Use the version injected at build
@@ -112,6 +177,11 @@ function banner() {
   console.log(chalk.bold.cyan('  MERCURY'));
   console.log(chalk.white('  Your soul-driven AI agent'));
   console.log(chalk.dim(`  v${pkgVersion} · by Cosmic Stack · mercuryagent.sh`));
+  // Dev-channel builds announce themselves on EVERY launch — a preview
+  // binary must never be mistaken for the stable distribution.
+  if (isDevBuild(pkgVersion)) {
+    console.log(chalk.yellow(`  ⚠ ${devBuildLabel(pkgVersion)} · not for production`));
+  }
   console.log('');
 }
 
@@ -125,17 +195,10 @@ function splashScreen() {
   console.log(chalk.dim('  Your soul-driven AI agent'));
   console.log(chalk.cyan('  by Cosmic Stack'));
   console.log(chalk.dim('  mercuryagent.sh'));
+  if (isDevBuild(pkgVersion)) {
+    console.log(chalk.yellow(`  ⚠ ${devBuildLabel(pkgVersion)}`));
+  }
   console.log('');
-}
-
-async function ask(prompt: string): Promise<string> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(prompt, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
 }
 
 function maskKey(key: string): string {
@@ -145,19 +208,23 @@ function maskKey(key: string): string {
 }
 
 const PROVIDER_OPTIONS: Array<{ key: ProviderName; label: string }> = [
-  { key: 'aimlapi', label: 'AI/ML API (recommended — 350+ models on one key)' },
-  { key: 'mercuryCloud', label: 'Mercury Cloud (hosted — no API keys needed)' },
+  { key: 'mercuryCloud', label: 'Mercury Cloud (recommended — quick start, no API keys)' },
+  { key: 'aimlapi', label: 'AI/ML API (350+ models on one key)' },
   { key: 'deepseek', label: 'DeepSeek' },
   { key: 'openai', label: 'OpenAI' },
   { key: 'anthropic', label: 'Anthropic' },
   { key: 'githubCopilot', label: 'GitHub Copilot' },
   { key: 'grok', label: 'Grok (xAI)' },
   { key: 'atlascloud', label: 'Atlas Cloud' },
+  { key: 'runcrate', label: 'Runcrate' },
+  { key: 'cloudgpu', label: 'CloudGPU' },
   { key: 'ollamaCloud', label: 'Ollama Cloud' },
   { key: 'ollamaLocal', label: 'Ollama Local' },
+  { key: 'atomicChat', label: 'Atomic Chat' },
   { key: 'openaiCompat', label: 'OpenAI Compilations' },
   { key: 'mimo', label: 'MiMo (Xiaomi)' },
   { key: 'mimoTokenPlan', label: 'MiMo Token Plan (Xiaomi)' },
+  { key: 'lmStudio', label: 'LM Studio' },
 ];
 
 function getConfiguredProviderNames(config: MercuryConfig): ProviderName[] {
@@ -236,7 +303,14 @@ async function chooseDefaultProvider(config: MercuryConfig): Promise<void> {
     return;
   }
 
-  const suggested = configured.includes('deepseek') ? 'deepseek' : configured[0];
+  // Suggest the CURRENT default when it's still configured — on reconfig,
+  // pressing Enter (the universal "keep current" convention in this wizard)
+  // must keep it, not jump to the hard-coded suggestion.
+  const suggested = configured.includes(config.providers.default)
+    ? config.providers.default
+    : configured.includes('deepseek')
+      ? 'deepseek'
+      : configured[0];
 
   console.log('');
   console.log(chalk.bold.white('  Default Provider'));
@@ -265,74 +339,6 @@ async function chooseDefaultProvider(config: MercuryConfig): Promise<void> {
 
     console.log(chalk.red('  Please choose a valid number from the list above.'));
   }
-}
-
-function looksLikeToken(value: string, minLength: number = 20): boolean {
-  return value.length >= minLength && !/\s/.test(value) && /[A-Za-z]/.test(value) && /\d/.test(value);
-}
-
-function validateApiKey(provider: ProviderName, value: string): string | null {
-  if (provider === 'openai') {
-    return /^sk-(proj-|svcacct-)?[A-Za-z0-9_-]{16,}$/i.test(value)
-      ? null
-      : 'OpenAI keys must start with `sk-`, `sk-proj-`, or `sk-svcacct-`.';
-  }
-
-  if (provider === 'anthropic') {
-    return /^sk-ant-[A-Za-z0-9_-]{16,}$/i.test(value)
-      ? null
-      : 'Anthropic keys must start with `sk-ant-`.';
-  }
-
-  if (provider === 'deepseek') {
-    return /^sk-[A-Za-z0-9_-]{16,}$/i.test(value)
-      ? null
-      : 'DeepSeek keys must start with `sk-`.';
-  }
-
-  if (provider === 'grok') {
-    return looksLikeToken(value)
-      ? null
-      : 'Grok keys must look like a real API token: long, no spaces, and not plain text.';
-  }
-
-  if (provider === 'ollamaCloud') {
-    return looksLikeToken(value)
-      ? null
-      : 'Ollama Cloud keys must look like a real API token: long, no spaces, and not plain text.';
-  }
-
-  if (provider === 'mimo') {
-    return /^sk-[A-Za-z0-9_-]{16,}$/i.test(value)
-      ? null
-      : 'MiMo keys must start with `sk-`.';
-  }
-
-  if (provider === 'mimoTokenPlan') {
-    return /^tp-[A-Za-z0-9_-]{16,}$/i.test(value)
-      ? null
-      : 'MiMo Token Plan keys must start with `tp-`.';
-  }
-
-  return null;
-}
-
-function validateBaseUrl(value: string): string | null {
-  try {
-    const parsed = new URL(value);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return 'Base URL must start with http:// or https://.';
-    }
-    return null;
-  } catch {
-    return 'Please enter a valid URL.';
-  }
-}
-
-function validateModelName(value: string): string | null {
-  if (!value.trim()) return 'Model name is required.';
-  if (/\s/.test(value)) return 'Model name cannot contain spaces.';
-  return null;
 }
 
 async function chooseProviderModel(
@@ -474,10 +480,7 @@ async function promptOllamaLocalModelSelection(config: MercuryConfig, isReconfig
 
   console.log(chalk.dim('  Fetching Ollama Local models...'));
   try {
-    const catalog = await fetchProviderModelCatalog('ollamaLocal', {
-      ...existingConfig,
-      baseUrl,
-    });
+    const catalog = await fetchProviderModelCatalog('ollamaLocal', withBaseUrl(existingConfig, baseUrl));
     const model = await chooseProviderModel(
       'Ollama Local',
       catalog.recommendedModel,
@@ -493,6 +496,117 @@ async function promptOllamaLocalModelSelection(config: MercuryConfig, isReconfig
     console.log(chalk.dim('  You can run `mercury doctor` later to configure Ollama after starting it.'));
 
     const manualModel = await ask(chalk.white(`  Ollama Local model name (Enter to skip Ollama Local for now): `));
+    if (!manualModel) {
+      return { skipped: true };
+    }
+
+    const modelError = validateModelName(manualModel);
+    if (modelError) {
+      console.log(chalk.red(`  ${modelError}`));
+      return { skipped: true };
+    }
+
+    return { baseUrl, model: manualModel, skipped: false };
+  }
+}
+
+async function promptLmStudioModelSelection(config: MercuryConfig, isReconfig: boolean): Promise<{ baseUrl?: string; model?: string; skipped: boolean }> {
+  const existingConfig = config.providers.lmStudio;
+
+  const baseUrlPrompt = isReconfig && existingConfig.baseUrl
+    ? chalk.white(`  LM Studio base URL [${existingConfig.baseUrl}]: `)
+    : chalk.white('  LM Studio base URL [Enter for http://127.0.0.1:1234/v1]: ');
+  const baseUrlInput = await ask(baseUrlPrompt);
+  if (!baseUrlInput || baseUrlInput.toLowerCase() === 'none') {
+    if (isReconfig && existingConfig.baseUrl) {
+      return { baseUrl: existingConfig.baseUrl, model: existingConfig.model, skipped: true };
+    }
+    return { skipped: true };
+  }
+  const baseUrlError = validateBaseUrl(baseUrlInput);
+  if (baseUrlError) {
+    console.log(chalk.red(`  ${baseUrlError}`));
+    if (isReconfig && existingConfig.baseUrl) {
+      return { baseUrl: existingConfig.baseUrl, model: existingConfig.model, skipped: true };
+    }
+    return { skipped: true };
+  }
+  const baseUrl = baseUrlInput;
+
+  console.log(chalk.dim('  Fetching LM Studio models...'));
+  try {
+    const catalog = await fetchProviderModelCatalog('lmStudio', withBaseUrl(existingConfig, baseUrl));
+    const model = await chooseProviderModel(
+      'LM Studio',
+      catalog.recommendedModel,
+      catalog.models,
+    );
+    return { baseUrl, model, skipped: false };
+  } catch (error) {
+    const message = error instanceof ProviderModelFetchError
+      ? error.message
+      : 'Mercury could not fetch LM Studio models.';
+    console.log(chalk.yellow(`  ${message}`));
+    console.log(chalk.dim('  Make sure LM Studio is running and the Developer API is enabled.'));
+    console.log(chalk.dim('  You can run `mercury doctor` later to configure LM Studio after starting it.'));
+
+    const manualModel = await ask(chalk.white(`  LM Studio model name (Enter to skip LM Studio for now): `));
+    if (!manualModel) {
+      return { skipped: true };
+    }
+
+    const modelError = validateModelName(manualModel);
+    if (modelError) {
+      console.log(chalk.red(`  ${modelError}`));
+      return { skipped: true };
+    }
+
+    return { baseUrl, model: manualModel, skipped: false };
+  }
+}
+
+async function promptAtomicChatModelSelection(config: MercuryConfig, isReconfig: boolean): Promise<{ baseUrl?: string; model?: string; skipped: boolean }> {
+  const existingConfig = config.providers.atomicChat;
+  const defaultBaseUrl = existingConfig.baseUrl || 'http://127.0.0.1:1337/v1';
+
+  const baseUrlPrompt = isReconfig && existingConfig.baseUrl
+    ? chalk.white(`  Atomic Chat base URL [${existingConfig.baseUrl}]: `)
+    : chalk.white(`  Atomic Chat base URL [${defaultBaseUrl}]: `);
+  const baseUrlInput = await ask(baseUrlPrompt);
+  if (baseUrlInput.toLowerCase() === 'none') {
+    if (isReconfig && existingConfig.baseUrl) {
+      return { baseUrl: existingConfig.baseUrl, model: existingConfig.model, skipped: true };
+    }
+    return { skipped: true };
+  }
+  const baseUrl = baseUrlInput || defaultBaseUrl;
+  const baseUrlError = validateBaseUrl(baseUrl);
+  if (baseUrlError) {
+    console.log(chalk.red(`  ${baseUrlError}`));
+    if (isReconfig && existingConfig.baseUrl) {
+      return { baseUrl: existingConfig.baseUrl, model: existingConfig.model, skipped: true };
+    }
+    return { skipped: true };
+  }
+
+  console.log(chalk.dim('  Fetching Atomic Chat models...'));
+  try {
+    const catalog = await fetchProviderModelCatalog('atomicChat', withBaseUrl(existingConfig, baseUrl));
+    const model = await chooseProviderModel(
+      'Atomic Chat',
+      catalog.recommendedModel,
+      catalog.models,
+    );
+    return { baseUrl, model, skipped: false };
+  } catch (error) {
+    const message = error instanceof ProviderModelFetchError
+      ? error.message
+      : 'Mercury could not fetch Atomic Chat models.';
+    console.log(chalk.yellow(`  ${message}`));
+    console.log(chalk.dim('  Make sure Atomic Chat is running and a model is loaded, or enter the model id manually.'));
+    console.log(chalk.dim('  You can run `mercury doctor` later after starting Atomic Chat.'));
+
+    const manualModel = await ask(chalk.white('  Atomic Chat model id (Enter to skip Atomic Chat for now): '));
     if (!manualModel) {
       return { skipped: true };
     }
@@ -526,8 +640,7 @@ async function promptOpenAICompatSetup(config: MercuryConfig, isReconfig: boolea
   console.log(chalk.dim('  Fetching models from server...'));
   try {
     const catalog = await fetchProviderModelCatalog('openaiCompat', {
-      ...existingConfig,
-      baseUrl,
+      ...withBaseUrl(existingConfig, baseUrl),
       apiKey: resolvedApiKey,
     });
     const model = await chooseProviderModel(
@@ -577,7 +690,11 @@ function appendToEnv(key: string, value: string): void {
   }
   const lines = envContent.split('\n').filter((l: string) => !l.startsWith(`${key}=`) && l.trim() !== '');
   lines.push(`${key}=${value}`);
-  writeFileSync(envPath, lines.join('\n') + '\n', 'utf-8');
+  // Holds API keys and bot tokens: owner-only, like config.yaml and the web
+  // credential files. `mode` only applies on create, so chmod repairs a
+  // file an older version wrote with the default umask (0644).
+  writeFileSync(envPath, lines.join('\n') + '\n', { encoding: 'utf-8', mode: 0o600 });
+  try { chmodSync(envPath, 0o600); } catch { /* best effort (Windows ACLs) */ }
   process.env[key] = value;
 }
 
@@ -723,6 +840,15 @@ function printSlackAccessState(config: MercuryConfig): void {
   console.log(`  Admins:         ${admins.length > 0 ? chalk.green(admins.map(formatSlackUser).join(', ')) : chalk.dim('none')}`);
   console.log(`  Members:        ${members.length > 0 ? chalk.green(members.map(formatSlackUser).join(', ')) : chalk.dim('none')}`);
   console.log(`  Pending:        ${pending.length > 0 ? chalk.yellow(pendingSummary) : chalk.dim('none')}`);
+}
+
+/** Content hash of mercury.yaml — `mercury doctor` restarts the daemon only when it changed. */
+function configFingerprint(): string {
+  try {
+    return createHash('sha256').update(readFileSync(join(getMercuryHome(), 'mercury.yaml'))).digest('hex');
+  } catch {
+    return '';
+  }
 }
 
 function restartDaemonIfRunning(message?: string): void {
@@ -1130,12 +1256,17 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
     console.log('');
   }
 
+  // Reconfig respects the current mode: the CURRENT connection mode is
+  // listed first (and therefore highlighted), so pressing Enter to "keep
+  // current" can't accidentally re-pair Mercury Cloud and reset the default
+  // provider — which used to silently override the user's last choice.
+  const inCloudMode = config.providers.default === 'mercuryCloud' || config.cloud.enabled === true;
+  const cloudOption = { value: 'cloud', label: 'Mercury Cloud (hosted — no API keys needed)' };
+  const offlineOption = { value: 'offline', label: 'Offline / BYOK (bring your own keys)' };
+  const modeOptions = isReconfig && !inCloudMode ? [offlineOption, cloudOption] : [cloudOption, offlineOption];
   const cloudChoice = await selectWithArrowKeys(
     isReconfig ? 'Connection Mode' : 'Choose your mode',
-    [
-      { value: 'cloud', label: 'Mercury Cloud (hosted — no API keys needed)' },
-      { value: 'offline', label: 'Offline / BYOK (bring your own keys)' },
-    ],
+    modeOptions,
   );
 
   let llmConfiguredByCloud = false;
@@ -1370,6 +1501,40 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
         continue;
       }
 
+      if (provider === 'runcrate') {
+        const mask = isReconfig && config.providers.runcrate.apiKey ? ` [${maskKey(config.providers.runcrate.apiKey)}]` : '';
+        const result = await promptApiKeyWithModelSelection(
+          config,
+          'runcrate',
+          'Runcrate',
+          chalk.white(`  Runcrate API key${mask}${isReconfig ? '' : ' (Enter to skip)'}: `),
+          isReconfig,
+        );
+        if (!result.skipped && result.apiKey && result.model) {
+          config.providers.runcrate.apiKey = result.apiKey;
+          config.providers.runcrate.model = result.model;
+          config.providers.runcrate.enabled = true;
+        }
+        continue;
+      }
+
+      if (provider === 'cloudgpu') {
+        const mask = isReconfig && config.providers.cloudgpu.apiKey ? ` [${maskKey(config.providers.cloudgpu.apiKey)}]` : '';
+        const result = await promptApiKeyWithModelSelection(
+          config,
+          'cloudgpu',
+          'CloudGPU',
+          chalk.white(`  CloudGPU API key${mask}${isReconfig ? '' : ' (Enter to skip)'}: `),
+          isReconfig,
+        );
+        if (!result.skipped && result.apiKey && result.model) {
+          config.providers.cloudgpu.apiKey = result.apiKey;
+          config.providers.cloudgpu.model = result.model;
+          config.providers.cloudgpu.enabled = true;
+        }
+        continue;
+      }
+
       if (provider === 'ollamaCloud') {
         const mask = isReconfig && config.providers.ollamaCloud.apiKey ? ` [${maskKey(config.providers.ollamaCloud.apiKey)}]` : '';
         const result = await promptApiKeyWithModelSelection(
@@ -1393,6 +1558,26 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
           config.providers.ollamaLocal.baseUrl = result.baseUrl;
           config.providers.ollamaLocal.model = result.model;
           config.providers.ollamaLocal.enabled = true;
+        }
+        continue;
+      }
+
+      if (provider === 'lmStudio') {
+        const result = await promptLmStudioModelSelection(config, isReconfig);
+        if (!result.skipped && result.baseUrl && result.model) {
+          config.providers.lmStudio.baseUrl = result.baseUrl;
+          config.providers.lmStudio.model = result.model;
+          config.providers.lmStudio.enabled = true;
+        }
+        continue;
+      }
+
+      if (provider === 'atomicChat') {
+        const result = await promptAtomicChatModelSelection(config, isReconfig);
+        if (!result.skipped && result.baseUrl && result.model) {
+          config.providers.atomicChat.baseUrl = result.baseUrl;
+          config.providers.atomicChat.model = result.model;
+          config.providers.atomicChat.enabled = true;
         }
         continue;
       }
@@ -2011,19 +2196,44 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
         console.log(chalk.dim('  Password unchanged.'));
       }
     } else {
-      console.log(chalk.dim('  Default password is Mercury@123 — set a custom one now or press Enter to keep it.'));
+      console.log(chalk.dim('  This password signs in the dashboard and new devices (Mercury Desktop, phones).'));
+      console.log(chalk.dim('  Press Enter to have Mercury make a strong one for you.'));
       console.log('');
-      const webPassword = await ask(chalk.white('  Web dashboard password [Mercury@123]: '));
-      if (webPassword.trim()) {
-        setWebPassword(webPassword.trim());
+      let chosen = '';
+      for (let attempt = 0; attempt < 3 && !chosen; attempt++) {
+        const typed = (await ask(chalk.white('  Web dashboard password [generate one]: '))).trim();
+        if (!typed) break;
+        if (typed.length < 10) { console.log(chalk.yellow('  Use at least 10 characters (or press Enter to generate one).')); continue; }
+        chosen = typed;
+      }
+      if (chosen) {
+        setWebPassword(chosen);
         console.log(chalk.green('  ✓ Web dashboard password set.'));
       } else {
-        console.log(chalk.dim('  Using default password: Mercury@123'));
+        const { initWebAuth: makeAuth, isWebAuthInitialized } = await import('./web/auth.js');
+        const generated = !isWebAuthInitialized() ? makeAuth().password : (() => { const p = randomBytes(12).toString('base64url'); setWebPassword(p); return p; })();
+        console.log(chalk.green(`  ✓ Username: mercury   Password: ${chalk.bold(generated)}`));
+        console.log(chalk.dim('  Save it in your password manager — it is shown only now. Change it any time with /server.'));
       }
     }
   } else {
     console.log(chalk.dim('  Web dashboard disabled. You can enable it later with `mercury doctor`.'));
   }
+
+  // Permission mode: asked once here and remembered by every surface
+  // (terminal, attached terminal, dashboard). /permissions changes it later.
+  console.log('');
+  const currentMode = loadPermissionMode();
+  const permissionChoice = await selectWithArrowKeys(
+    currentMode ? `Permissions (now: ${currentMode === 'allow-all' ? 'Allow All' : 'Ask Me'})` : 'How should Mercury handle risky actions?',
+    [
+      { value: 'ask-me', label: 'Ask Me — confirm before it writes files or runs commands' },
+      { value: 'allow-all', label: 'Allow All — just do it (blocked commands stay blocked)' },
+    ],
+  );
+  const permissionMode = permissionChoice === 'allow-all' ? 'allow-all' : 'ask-me';
+  savePermissionMode(permissionMode);
+  console.log(chalk.dim(`  ${permissionMode === 'allow-all' ? 'Allow All' : 'Ask Me'} saved · change any time with /permissions`));
 
   saveConfig(config);
 
@@ -2043,18 +2253,86 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
   console.log('');
 }
 
-function autoDaemonize(): void {
+/**
+ * The runtime passed the PID-liveness check but its web endpoint is dead — a
+ * hung process, or a web server that failed to bind (EADDRINUSE leaves the
+ * daemon alive but web-less). Without this, the single-runtime rule bricked
+ * the launcher: every `mercury` invocation attached into the dead end and
+ * exited, and only a user who knew to run `mercury stop` could recover.
+ * The user's intent when typing `mercury` is to chat, so restart and boot.
+ */
+/**
+ * Auto-attach entry for launch paths that found a "running" runtime. Attach,
+ * or — when the runtime proved unresponsive — heal it and boot fresh.
+ */
+/**
+ * Attach, and if the user asks for Mercury Code from inside the attach TUI,
+ * boot it here: runAgent() beside the live daemon is a terminal for the
+ * main agent only (ADR-024) and honours MERCURY_BOOT_CODE.
+ */
+async function attachOrCode(opts?: Parameters<typeof runAttach>[0]): Promise<AttachResult> {
+  const result = await runAttach(opts);
+  if (result === 'code') {
+    await runAgent();
+    return 'attached';
+  }
+  return result;
+}
+
+async function attachOrHeal(): Promise<void> {
+  const result = await attachOrCode();
+  if (result === 'attached') return;
+  if (result !== 'unhealthy') { process.exitCode = 1; return; }
+  await healRuntimeAndBoot();
+}
+
+async function healRuntimeAndBoot(): Promise<void> {
+  console.log(chalk.yellow('  Runtime is not responding — restarting it...'));
+  await stopForegroundRuntime();
+  await stopDaemon();
+  await bootDaemonThenAttach();
+}
+
+/**
+ * The daemon is the runtime; the terminal attaches to it. Only when no
+ * daemon can run here (Termux, unsupported platform) does the terminal
+ * become the runtime itself.
+ */
+async function bootDaemonThenAttach(): Promise<void> {
+  if (!autoDaemonize()) {
+    await runAgent();
+    return;
+  }
+  const result = await attachOrCode();
+  if (result === 'attached') return;
+  // The daemon came up but we could not attach (web disabled, port taken):
+  // a terminal for the main agent only — runAgent() sees the live daemon
+  // and leaves channels, bots and the port to it.
+  await runAgent();
+}
+
+function autoDaemonize(): boolean {
   const daemon = getDaemonStatus();
   if (daemon.running && daemon.pid) {
-    return;
+    return true;
   }
 
   console.log(chalk.dim('  Setting up background mode...'));
 
+  // installService() never exits the process (Termux / unsupported platforms
+  // print a hint and return false) \u2014 the daemon is still started below so
+  // the wizard flow completes on phones too.
+  let serviceInstalled = false;
   try {
-    if (!isServiceInstalled()) {
-      installService();
+    // A service left behind by a previous install (npm global, an older
+    // binary) resurrects THAT daemon on every login — the new build then
+    // never owns the port. Re-point it before starting anything.
+    const drift = serviceDrift();
+    if (drift) {
+      console.log(chalk.yellow(`  Login service launches an older install: ${drift.installed}`));
+      console.log(chalk.yellow(`  Re-pointing it to this build: ${drift.expected}`));
     }
+    serviceInstalled = (isServiceInstalled() && !drift) || installService();
   } catch {
     console.log(chalk.dim('  Service install skipped (can run `mercury service install` later).'));
   }
@@ -2063,12 +2341,17 @@ function autoDaemonize(): void {
   if (ok) {
     const status = getDaemonStatus();
     console.log(chalk.green(`  \u2713 Mercury is running in background (PID: ${status.pid})`));
-    console.log(chalk.green('  \u2713 Auto-starts on login. Auto-restarts on crash.'));
+    if (serviceInstalled) {
+      console.log(chalk.green('  \u2713 Auto-starts on login. Auto-restarts on crash.'));
+    } else {
+      console.log(chalk.dim('  No login service on this platform \u2014 run `mercury up` after a reboot.'));
+    }
     console.log(chalk.dim('  Use `mercury stop` to stop. `mercury restart` to restart.'));
   } else {
     console.log(chalk.yellow('  Background mode not available. Run `mercury start` to set it up.'));
   }
   console.log('');
+  return getDaemonStatus().running;
 }
 
 function runPlatformDoctor(): void {
@@ -2086,7 +2369,7 @@ function runPlatformDoctor(): void {
   console.log(chalk.dim('  Cross-platform runtime compatibility report'));
   console.log('');
   console.log(`  OS:                 ${chalk.white(process.platform)} (${process.arch})`);
-  console.log(`  Node.js:            ${chalk.white(process.version)} (required >= 20)`);
+  console.log(`  Node.js:            ${chalk.white(process.version)} (required >= 22)`);
   console.log(`  Terminal program:   ${chalk.white(termProgram)}`);
   console.log(`  TERM:               ${chalk.white(term)}`);
   console.log(`  Interactive TTY:    ${isTTY ? chalk.green('yes') : chalk.yellow('no')}`);
@@ -2094,7 +2377,13 @@ function runPlatformDoctor(): void {
   console.log(`  SSH session:        ${sshSession ? chalk.yellow('yes') : chalk.green('no')}`);
   console.log(`  CI environment:     ${ci ? chalk.yellow('yes') : chalk.green('no')}`);
   console.log(`  Daemon:             ${daemon.running ? chalk.green(`running (PID: ${daemon.pid})`) : chalk.dim('not running')}`);
+  {
+    const drift = serviceDrift();
+    console.log(`  Login service:      ${!isServiceInstalled() ? chalk.dim('not installed') : drift ? chalk.red(`STALE — launches ${drift.installed} (run mercury service install)`) : chalk.green('points at this install')}`);
+  }
   console.log(`  Spotify inline art: ${canInlineArt ? chalk.green('supported (iTerm local)') : chalk.dim('disabled/fallback mode')}`);
+  const inkPatch = detectInkPatch();
+  console.log(`  Ink TUI patch:      ${inkPatch.patched ? chalk.green(describeInkPatch(inkPatch)) : chalk.red(describeInkPatch(inkPatch))}`);
   console.log('');
   console.log(chalk.bold.white('  Keybinding Notes'));
   console.log(`  • View toggle:      ${chalk.white('Ctrl+T')} (fallback: ${chalk.white('/view')})`);
@@ -2107,11 +2396,26 @@ function runPlatformDoctor(): void {
     console.log(chalk.dim('  Try a local terminal session with TTY support for the best experience.'));
     console.log('');
   }
+
+  if (!inkPatch.patched) {
+    console.log(chalk.yellow('  Warning: the ink patch set is not active — the TUI stops rendering new messages after ~100 and may crash on long sessions.'));
+    console.log(chalk.dim(`  Fix: ${inkPatchFixCommand()}  (then restart Mercury)`));
+    console.log('');
+  }
 }
 
 async function runAgent(isDaemon: boolean = false): Promise<void> {
   const runtimeMode = isDaemon ? 'daemon' : 'foreground';
+  // launchd/systemd units carry a pinned PATH; Task Scheduler cannot.
+  if (isDaemon) pinDaemonPathOnWindows();
   registerRuntimeProcess(runtimeMode);
+  // ONE runtime owns channels, bots and the web port. A foreground runtime
+  // beside a live daemon (mercury code, a recovery boot) is a terminal for
+  // the main agent only: a second fleet in the TUI process ran every bot
+  // turn on the thread that paints keystrokes, and a second Telegram poller
+  // made Telegram answer 409 to both. (ADR-024)
+  const daemonOwnsRuntime = !isDaemon && getDaemonStatus().running;
+  startLoopLagMonitor();
 
   // Crash forensics: V8 fatal errors (heap OOM etc.) print a native stack
   // that scrolls away with the TUI. Ask V8 to keep a stack trace for the
@@ -2123,12 +2427,16 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     const { appendFileSync } = await import('node:fs');
     const dumpFile = join(getMercuryHome(), 'crash-report.log');
     const line = (m: string) => appendFileSync(dumpFile, `[${new Date().toISOString()}] ${m}\n`);
+    removeBootCrashHandlers();
     Error.stackTraceLimit = 50;
     if (typeof (process as any).report !== 'undefined') {
       try { (process as any).report.uncaughtException = true; } catch { /* unsupported */ }
     }
     process.on('uncaughtException', (err) => {
       try { line(`UNCAUGHT: ${err?.stack || err}`); } catch { /* disk full */ }
+      // A throw from a plugin's own code (a stray timer, an event handler)
+      // disables that plugin instead of taking Mercury down with it.
+      try { if (peekPluginManager()?.attributeFault(err)) return; } catch { /* fall through to exit */ }
       try { writeCrashFlag({ reason: `Uncaught: ${String(err?.message || err)}`.slice(0, 300), timestamp: Date.now() }); } catch {}
       // A TUI-crashed process must not linger headless: it would hold the
       // runtime pid files and silently block every future launch. Print,
@@ -2140,12 +2448,13 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     });
     process.on('unhandledRejection', (reason) => {
       try { line(`REJECTION: ${reason instanceof Error ? reason.stack : String(reason)}`); } catch {}
+      try { if (peekPluginManager()?.attributeFault(reason)) return; } catch { /* keep going */ }
       // A rejected boot (e.g. "runtime already running") must fail loudly,
       // not exit(0) as if nothing happened.
       const message = String(reason instanceof Error ? reason.message : reason || '');
       if (/already running|EADDRINUSE|registerRuntimeProcess/i.test(message)) {
         try {
-          process.stderr.write(`\n✗ Mercury cannot start: ${message}\n  Stop the other instance with \`mercury stop\` or \`kill <pid>\`.\n`);
+          process.stderr.write(`\n✗ Mercury cannot start: ${message}\n  Attach to it with \`mercury attach\`, or stop it with \`mercury stop\` / \`kill <pid>\`.\n`);
         } catch { /* stderr gone */ }
         process.exit(1);
       }
@@ -2186,6 +2495,7 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     logger.info(`${name} is waking up (daemon mode)...`);
   }
 
+  if (daemonOwnsRuntime) logger.info({ daemonPid: getDaemonStatus().pid }, 'Background daemon owns channels, bots and web — this terminal runs the main agent only');
   const tokenBudget = new TokenBudget(config);
 
   // Initialize the shared cloud token store before providers so the
@@ -2199,6 +2509,20 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
   if (!providers.hasProviders()) {
     if (isDaemon) {
       logger.error('No LLM providers available. Run `mercury doctor` to configure providers.');
+      if (config.web.enabled) {
+        // Setup mode: keep the API up so Mercury Desktop or the dashboard
+        // can connect a provider (there is no terminal on a desktop
+        // install). The first working provider restarts into normal mode.
+        setFirstProviderHandler(() => {
+          logger.info('A provider is connected; restarting out of setup mode');
+          if (!spawnDetachedRestart()) logger.error('Could not restart out of setup mode; run `mercury restart`');
+        });
+        startWebServer();
+        writeAttachToken();
+        updateWebStatus({ running: true, pid: process.pid, state: 'setup' });
+        setShutdownHandler(() => { void stopWebServer().finally(() => { releaseRuntimeProcess('daemon'); process.exit(0); }); });
+        logger.warn('Setup mode: connect a model provider from Mercury Desktop or the dashboard');
+      }
       return;
     }
     console.log(chalk.red('  No LLM providers available. Run `mercury doctor` to configure providers.'));
@@ -2235,12 +2559,25 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
   migrateLegacyMemory();
   const shortTerm = new ShortTermMemory(config);
   const sessions = new SessionRepository();
+  // Artifacts follow their thread: drop those whose thread is gone (deleted anywhere), now and every hour.
+  setArtifactSessions(sessions);
+  setArtifactOutputDir(() => config.artifacts?.outputDir);
+  const sweepArtifacts = () => {
+    try {
+      const removed = artifactStore().reconcile((id) => { try { return sessions.get(id).status !== 'deleted'; } catch { return false; } });
+      if (removed) logger.info({ removed }, 'Removed artifacts of deleted threads');
+    } catch (err) { logger.warn({ err }, 'Artifact sweep failed'); }
+  };
+  sweepArtifacts();
+  setInterval(sweepArtifacts, 60 * 60_000).unref();
+  // Desktop voice calls are saved as chat threads, live.
+  recordVoiceCalls(sessions);
   setWebSessions(sessions);
   const longTerm = new LongTermMemory(config);
   const episodic = new EpisodicMemory(config);
 
   let userMemory: UserMemoryStore | null = null;
-  if (config.memory.secondBrain?.enabled !== false && isBetterSqlite3Available()) {
+  if (config.memory.secondBrain?.enabled !== false && isSqliteAvailable()) {
     try {
       userMemory = new UserMemoryStore(config);
       setWebUserMemory(userMemory);
@@ -2253,17 +2590,37 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
       logger.warn({ err }, 'Second brain initialization failed, continuing without it');
       userMemory = null;
     }
-  } else if (config.memory.secondBrain?.enabled !== false && !isBetterSqlite3Available()) {
-    logger.warn(
-      'Second brain dependency issue: better-sqlite3 is not available. ' +
-      'Memory/brain features require SQLite via better-sqlite3. Install build tools and reinstall dependencies.'
-    );
+  } else if (config.memory.secondBrain?.enabled !== false && !isSqliteAvailable()) {
+    logger.warn(`Second brain disabled: ${SECOND_BRAIN_UNAVAILABLE_MESSAGE}`);
   }
 
-  const channels = new ChannelRegistry(config);
+  // "Is it a person?" for names new memories mention: batched, slow, capped.
+  // Only the process that owns the runtime runs it (never a second terminal).
+  if (userMemory && !daemonOwnsRuntime) {
+    const memForChecks = userMemory;
+    const verifier = new PersonVerifier(memForChecks, async (items) => {
+      const provider = providers.getDefault();
+      const { generateText } = await import('ai');
+      const result = await generateText({ model: provider.getModelInstance(), prompt: personCheckPrompt(items), maxOutputTokens: 400 });
+      const usage = (result as { usage?: { inputTokens?: number; outputTokens?: number } }).usage;
+      tokenBudget.recordUsage({ provider: provider.name, model: provider.getModel(), inputTokens: usage?.inputTokens ?? 0, outputTokens: usage?.outputTokens ?? 0, totalTokens: (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0), channelType: 'internal' });
+      return parsePersonCheck(result.text, items);
+    });
+    verifier.start();
+    setPersonVerifier(verifier);
+  }
+
+  const channels = new ChannelRegistry(config, { cliOnly: daemonOwnsRuntime });
   const webChannel = new WebChannel(config.identity.name);
   channels.register('web', webChannel);
+  // Bits of the bottom-bar status that are pushed rather than read.
+  const liveStatus = { desktop: '' };
   const capabilities = new CapabilityRegistry(skillLoader, scheduler, tokenBudget, undefined, userMemory ?? undefined);
+  // "Always" on a shell prompt covers the command family in the owner's own
+  // terminal, attached terminal and dashboard; remote Mercury Cloud requests
+  // stay exact-match.
+  capabilities.permissions.setFamilyApprovalPolicy((ctx) =>
+    ctx.channelType === 'cli' || (ctx.channelType === 'web' && !webChannel.hasCloudEventHandler(ctx.channelId)));
 
   let supervisor: SubAgentSupervisor | undefined;
   if (config.subagents.enabled) {
@@ -2303,6 +2660,7 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     memoryGetSubconscious: (limit?: number) => userMemory ? userMemory.getSubconscious(limit) : [],
     memoryIsShareLearning: () => userMemory ? userMemory.isShareLearning() : false,
     memorySetShareLearning: (enabled: boolean) => { if (userMemory) userMemory.setShareLearning(enabled); },
+    mcpStatus: () => capabilities.getMcpManager()?.status() ?? [],
   });
 
   capabilities.setSendFileHandler(async (filePath: string, channel?: string) => {
@@ -2328,6 +2686,16 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     if (channelType === 'signal' && signal) {
       await signal.sendFile(filePath, channelId);
       return;
+    }
+
+    // Any other chat channel (plugin channels such as WhatsApp): the file goes
+    // back to the chat that asked for it.
+    if (channelType !== 'cli' && channelType !== 'web' && channelType !== 'internal') {
+      const current = channels.get(channelType as Parameters<typeof channels.get>[0]);
+      if (current) {
+        await current.sendFile(filePath, channelId);
+        return;
+      }
     }
 
     if (config.channels.telegram.enabled && telegram && getTelegramApprovedUsers(config).length > 0) {
@@ -2363,24 +2731,193 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     setGitHubToken(process.env.GITHUB_TOKEN);
   }
 
+  // Image generation (ADR-042): image models on the configured providers.
+  const media = new MediaService({
+    sources: () => [
+      ...providers.listAvailable().flatMap((name) => {
+        const p = providers.get(name);
+        return p ? [{ name, baseUrl: p.getBaseUrl(), endpoint: () => p.mediaEndpoint() }] : [];
+      }),
+      // Keys saved for voice (Settings → Voice) make media too: Gemini (images, Omni video, Lyria music), ElevenLabs (music).
+      ...mediaKeySources(),
+    ],
+    currentProvider: () => providers.getDefault()?.name,
+  });
+  setMediaService(media);
+  const mediaOutputDir = () => {
+    // A chat works in its own artifacts folder; the terminal's media go to Images/ there, not into a project.
+    const root = outputRoot(config.artifacts?.outputDir);
+    const cwd = capabilities.getCwd();
+    return cwd.startsWith(root) ? cwd : join(root, 'Images');
+  };
+  const deliverMedia = async (files: string[]): Promise<string> => {
+    const { channelId, channelType } = capabilities.getChannelContext();
+    if (channelType === 'web') return 'It is shown in the app.';
+    if (channelType === 'cli') return 'The terminal shows its path; it is also in Mercury Desktop → Artifacts.';
+    if (channelType === 'internal') return 'Saved.';
+    const channel = channels.get(channelType as Parameters<typeof channels.get>[0]);
+    if (!channel) return 'Saved (this chat can\'t receive files).';
+    for (const file of files) await channel.sendFile(file, channelId);
+    return 'Sent to this chat.';
+  };
+  const speech = new SpeechService(media.sourcesForSpeech());
+  setSpeechService(speech);
+  capabilities.setSpeechGeneration({
+    speech,
+    outputDir: mediaOutputDir,
+    inChatApp: () => !['web', 'cli', 'internal'].includes(capabilities.getChannelContext().channelType),
+    deliver: deliverMedia,
+  });
+  capabilities.setImageGeneration({ media, outputDir: mediaOutputDir, deliver: deliverMedia });
+  // Videos and songs take minutes: background jobs, posted to the chat when ready (phase 3).
+  // `agent` is created below; jobs only finish after it exists.
+  const jobs = new MediaJobs(
+    (job, note) => agentRef.current ? agentRef.current.deliverMediaJob(job, note) : Promise.resolve(),
+    undefined,
+    // The apps hold a placeholder for it until it arrives.
+    (job) => { if (job.chat.channelType === 'web') (channels.get('web') as WebChannel | undefined)?.sendMediaPending(job, job.chat.channelId); },
+  );
+  setMediaJobs(jobs);
+  const agentRef: { current: Agent | null } = { current: null };
+  capabilities.setMediaJobs({
+    media,
+    jobs,
+    outputDir: mediaOutputDir,
+    chat: () => {
+      const { channelId, channelType } = capabilities.getChannelContext();
+      const sessionId = agentRef.current?.currentChatKey();
+      return { channelType, channelId, ...(channelType === 'web' && sessionId ? { sessionId } : {}) };
+    },
+  });
+
+  // Mercury's own word to the owner in the current chat (a new schedule, ADR-044): never left to the model.
+  capabilities.setOwnerNotice((text) => {
+    const { channelId, channelType } = capabilities.getChannelContext();
+    const target = channelType === 'internal' ? channels.getNotificationChannel() : channels.get(channelType as Parameters<typeof channels.get>[0]);
+    if (!target) return;
+    if (target instanceof WebChannel) { target.sendProgressNote(text, channelId); return; }
+    const cli = target as unknown as { sendSystemNotice?: (t: string) => void };
+    if (channelType === 'cli' && typeof cli.sendSystemNotice === 'function') { cli.sendSystemNotice(text); return; }
+    void target.send(text, channelType === 'internal' ? undefined : channelId).catch(() => {});
+  });
+
   capabilities.registerAll();
 
-  const agent = new Agent(
+  const mcpConfig = validateMcpConfig(config.mcp);
+  for (const problem of mcpConfig.problems) logger.warn({ problem }, 'MCP server skipped');
+  for (const warning of mcpConfig.warnings) logger.warn({ warning }, 'MCP config warning');
+  // Like plugins (ADR-025), only the runtime owner connects MCP servers: a
+  // terminal attached to a live daemon must not start every stdio server twice.
+  const mcpManager = daemonOwnsRuntime ? undefined : new McpManager(mcpConfig.servers, {
+    gate: (request) => capabilities.permissions.checkMcpTool(request),
+    resourceGate: (request) => capabilities.permissions.checkMcpResource(request),
+  });
+  if (mcpManager) {
+    capabilities.attachMcp(mcpManager);
+    setWebMcpManager(mcpManager);
+    void mcpManager.connectAll();
+  }
+
+  const agent = agentRef.current = new Agent(
     config, providers, identity, shortTerm, longTerm, episodic, userMemory, channels, tokenBudget, capabilities, scheduler, sessions,
     async ({ userMessage, assistantMessage, providerName }) => {
       const provider = providers.get(providerName) ?? providers.getDefault();
-      const result = await provider.generateText(
-        `User: ${userMessage.slice(0, 1500)}\nAssistant: ${assistantMessage.slice(0, 1500)}`,
-        'Create a concise 3-7 word title for this conversation. Return only the title with no quotes, markdown, prefix, or punctuation.',
-      );
+      const result = await provider.generateText(titlePrompt(userMessage, assistantMessage), TITLE_SYSTEM_PROMPT);
       return result.text;
     },
   );
 
+  // Videos or songs cut off by the last restart: tell their chats (once the channels are up).
+  // Only the process that runs them: a terminal attached to the daemon must not touch the daemon's jobs.
+  if (!daemonOwnsRuntime) setTimeout(() => { void jobs.recover().catch(() => {}); }, 10_000).unref?.();
   agent.setSkillLoader(skillLoader);
+  agent.terminalOnly = daemonOwnsRuntime;
+  setSuggestionEngine(agent.suggestions, sessions);
 
   if (supervisor) {
     agent.setSupervisor(supervisor);
+  }
+
+  // Plugins run only in the process that owns the runtime (ADR-024); an
+  // attached terminal forwards /plugins to it. Boot is fire-and-forget:
+  // a broken plugin is disabled, never a reason for Mercury not to start.
+  const pluginManager = daemonOwnsRuntime ? undefined : getPluginManager();
+  if (pluginManager) {
+    // Plugin API 1.1: channels provided by plugins (e.g. WhatsApp) join the registry while they run.
+    setChannelHost({
+      register: (type, channel) => channels.register(type, channel),
+      unregister: (type, channel) => channels.unregister(type, channel),
+    });
+    // Plugins that use a Mercury provider (e.g. OpenAI for WhatsApp calls)
+    // get the same credentials this runtime uses: one place to set a key.
+    setProviderLookup((id) => (config.providers as unknown as Record<string, { apiKey?: string; baseUrl?: string } | undefined>)[id]);
+    // Calls know what chats know (identity, about, the owner's profile) and learn like chats do.
+    setVoiceBriefing(() => agent.voiceBriefing());
+    setCallLearning((ownerSaid, mercurySaid) => agent.learnFromConversation(ownerSaid, mercurySaid));
+    setWorkStopper((prefix) => agent.stopWorkFor(prefix, 'Stopped by the owner on a voice call.'));
+    setWorkProbe((channelId) => agent.workStateFor(channelId));
+    setDesktopActivityHook((label) => {
+      const cli = channels.get('cli');
+      if (cli instanceof CLIChannel) cli.setDesktopActivity(label);
+      liveStatus.desktop = label ?? '';
+      publishStatus();
+    });
+    pluginManager.setRunsPlugins(true);
+    pluginManager.setNotifier((m) => agent.notifyAllChannels(m));
+    void pluginManager.boot().catch((err) => logger.error({ err }, 'Plugin boot failed'));
+  }
+
+  // Mercury Bots: fleet manager runs outside the main message queue.
+  let botManager: BotManager | undefined;
+  if (config.bots?.enabled && !daemonOwnsRuntime) {
+    const bot = new BotManager({
+      config,
+      providers,
+      tokenBudget,
+      userMemoryFactory: (_botId, manifest) => {
+        const scope = manifest.memory?.scope ?? 'own';
+        if (scope === 'none') return null;
+        if (!userMemory) return null; // second brain unavailable — bots run stateless
+        // Bots share the second-brain DB but are namespaced per bot.
+        return new UserMemoryStore(config, `bot:${manifest.id}`);
+      },
+    });
+    botManager = bot;
+    bot.setScheduler(scheduler);
+    // Startup migrations must run before routines register: fleet layout
+    // (crew nesting + orphan cascade) and permission consolidation to the
+    // single permissions.yaml source.
+    void bot.migrateFleetLayout()
+      .then(() => bot.migratePermissions())
+      .then(() => bot.migrateDeliverables())
+      .then(() => bot.registerRoutines(scheduler));
+    agent.setBotManager(bot);
+    setWebBotManager(bot);
+    // Real-time bot activity bus → surfaces: the CLI bot-thread live region
+    // (what the bot is doing RIGHT NOW while you watch its thread) and the
+    // web SSE feed (dashboards / third-party backends). The roster's activity
+    // label is updated inside the manager itself.
+    const botCliChannel = channels.get('cli');
+    bot.onBotActivity((ev) => {
+      if (botCliChannel instanceof CLIChannel && ev.kind !== 'queued') botCliChannel.setBotLiveActivity(ev.botId, { ...ev, kind: ev.kind });
+      webChannel.broadcastBotActivity(ev);
+    });
+    if (config.bots?.webhookSecret) {
+      setBotsWebhookSecret(config.bots.webhookSecret);
+    }
+    // Main-agent awareness: bots section in the system prompt + dispatch tool.
+    capabilities.setBotDispatchHandler((botIdOrName, message, ctx) => {
+      const botId = bot.resolveBotId(botIdOrName);
+      if (!botId) return { accepted: false, reasonCode: 'target_unknown' };
+      const result = bot.enqueue(botId, {
+        trigger: 'chat',
+        prompt: message,
+        source: { channelType: ctx.channelType, channelId: ctx.channelId },
+      });
+      return result.accepted
+        ? { accepted: true, jobId: result.jobId }
+        : { accepted: false, reasonCode: result.reasonCode };
+    }, () => capabilities.getChannelContext());
   }
 
   let spotifyClient: SpotifyClient | undefined;
@@ -2436,8 +2973,19 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
           startedAt: 0,
         })) : [],
         bgTasks: () => agent.backgroundTasks.getAllSummaries(),
+        botRoster: () => agent.getBotManager()?.getStatusSummaries().map((b) => ({
+          id: b.id,
+          name: b.name,
+          state: b.state,
+          needsYou: b.needsYou,
+          fleetRole: b.fleetRole,
+          parent: b.parent,
+        })) ?? [],
       });
       bootCli.startStatusPoller(2000);
+      // Esc during a turn: the same stop routine `/stop` runs — for the
+      // terminal's own task; with none, whatever the terminal is showing.
+      bootCli.setInterruptHandler(() => agent.stopAllWork('stopped', agent.turnForChannel('cli') ? { channelId: 'cli' } : undefined));
       bootCli.mountTUI((inputText: string) => {
         bootCli.sendUserMessage(inputText);
       }, spotifyClient, () => {
@@ -2447,6 +2995,25 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
         try { agent.cancelActiveWork('Mercury Code was exited from the TUI.'); } catch { /* best effort */ }
         process.exit(0);
       });
+      // `mercury code [dir]`: boot straight into the Mercury Code TUI in the
+      // requested (default: current) directory with a FRESH session. The flag
+      // is set by the `code` command action and consumed here, in the
+      // foreground process only (the daemon child ignores it).
+      if (process.env.MERCURY_BOOT_CODE) {
+        const bootDir = process.env.MERCURY_BOOT_CODE === '1' ? process.cwd() : process.env.MERCURY_BOOT_CODE;
+        delete process.env.MERCURY_BOOT_CODE;
+        const fresh = sessions.create();
+        sessions.bind(fresh.id, 'cli', 'current');
+        const activeSession = sessions.get(fresh.id);
+        if (activeSession) bootCli.setCurrentSession(activeSession);
+        agent.programmingMode.setAuto();
+        agent.programmingMode.setProjectContext(bootDir);
+        const entered = bootCli.enterMercuryCode(bootDir, pkgVersion);
+        bootCli.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+        await bootCli.send(entered.ok
+          ? 'Mercury Code active (AUTO). Describe the change — I will plan and build in one flow, confirming with you only before large or consequential changes.'
+          : `Mercury Code could not start: ${entered.message}`);
+      }
     } else {
       await channels.startAll();
     }
@@ -2535,7 +3102,13 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
       cloudClient.on('skill.install', async (msg) => {
         const skillUrl = msg.payload?.skillUrl as string | undefined;
         if (skillUrl) {
-          logger.info({ skillUrl }, 'Cloud command: install skill');
+          logger.info('Cloud command: install skill (asking the owner)');
+          // A skill is instructions Mercury follows from then on: the owner decides, not the Cloud account.
+          const { askOwner } = await import('./security/owner-approvals.js');
+          if (!(await askOwner({ title: 'Install a skill sent by Mercury Cloud', who: 'Mercury Cloud', detail: skillUrl.slice(0, 300) }))) {
+            cloudClient!.send({ type: 'skill.ack', agentId: config.cloud.agentId, payload: { success: false, error: 'The owner did not approve installing this skill.' }, timestamp: new Date().toISOString() });
+            return;
+          }
           try {
             await skillLoader.installFromUrl(skillUrl);
             cloudClient!.send({
@@ -2838,6 +3411,15 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
             cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'error', data: { message: 'Invalid permission mode request.' } });
             return;
           }
+          if (action === 'allow-all') {
+            // Acting without asking, switched on from Cloud: the owner confirms it first.
+            cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'notice', data: { message: 'Waiting for the owner to approve Allow All on their own device…' } });
+            const { askOwner } = await import('./security/owner-approvals.js');
+            if (!(await askOwner({ title: 'Turn on Allow All for a chat, from Mercury Cloud', who: 'Mercury Cloud' }))) {
+              cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'error', data: { message: 'The owner did not approve Allow All.' } });
+              return;
+            }
+          }
           webChannel.setSessionPermissionMode(suppliedSessionId, action);
           cloudClient!.sendStream({
             conversationId,
@@ -2854,9 +3436,9 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
             cloudClient!.sendStream({ conversationId, requestId, event: 'error', data: { message: 'Stop requires the session the task belongs to.' } });
             return;
           }
-          // Same semantics as the local /stop fast-path command: abort the
-          // foreground task, cancel its work-ledger entry, halt sub-agents.
-          const note = await agent.stopAllWork('stopped');
+          // Same semantics as the local /stop fast-path command: abort this
+          // session's task, cancel its work-ledger entry, halt its sub-agents.
+          const note = await agent.stopAllWork('stopped', { sessionId: suppliedSessionId });
           cloudClient!.sendStream({
             conversationId,
             sessionId: suppliedSessionId,
@@ -3044,12 +3626,103 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     sigChannel.setChatCommandContext(capabilities.getChatCommandContext()!);
   }
 
+  // Settings → Channels: changes apply to this live config, and a channel restarts on its own.
+  const wireChannel = (ch: Channel) => {
+    if (ch instanceof TelegramChannel || ch instanceof SignalChannel) ch.setChatCommandContext(capabilities.getChatCommandContext()!);
+  };
+  setChannelRuntime({
+    config: () => config,
+    restart: (type) => channels.restart(type, config, wireChannel),
+    running: (type) => channels.get(type)?.isReady() ?? false,
+    notify: (type, target, text) => channels.get(type)?.send(text, target) ?? Promise.resolve(),
+  });
+
   setWebWebChannel(webChannel);
   setWebSessionSyncEnabled(() => agent.isSessionSyncEnabled());
   setWebProgrammingMode(agent.programmingMode);
   setWebBgTasks(agent.backgroundTasks);
-  setWebModelSwitch((provider) => agent.switchProvider(provider));
+  // Calls and notifications to the owner's phone, over its live connection (ADR-046).
+  // Only the process that serves the phones (not a terminal attached to the daemon).
+  if (!daemonOwnsRuntime) {
+    const phoneReach = setupPhoneReach({
+      messageOwner: async (text) => { await channels.getNotificationChannel()?.send(text); },
+    });
+    agent.backgroundTasks.onAnyComplete((task) => { void onBackgroundTaskDone(task); });
+    botManager?.inbox.onEntry((entry) => { void onBotInboxEntry(entry); });
+    process.once('exit', () => { phoneReach.scheduler.stop(); });
+  }
+  setWebModelSwitch((provider, model) => agent.switchProvider(provider, model));
+  setProvidersReload(() => agent.reloadProviders());
+  // Settings-free skill builder: the default model writes a skill from the owner's description.
+  setSkillBuilder({ provider: () => providers.getDefault(), tools: () => Object.keys(capabilities.getTools()).sort() });
+  setCloudReload(() => agent.reloadProviders());
+  setWebStop((target) => agent.stopAllWork('stopped', target));
+  setWebSessionBusy((sessionId) => agent.isBusyWith(sessionId));
+  setWebQueueControls({ state: (id) => agent.queueStateFor(id), prioritize: (id) => agent.prioritize(id) });
+  setWebTurnControls({
+    running: () => agent.runningTurns().map((t) => ({
+      ...(t.sessionId ? { sessionId: t.sessionId } : {}),
+      channelType: t.channelType, channelId: t.channelId, startedAt: t.startedAt, activity: t.activity, steps: t.completedSteps,
+    })),
+    waiting: () => agent.waitingChats(),
+    live: (id) => agent.liveTurn(id),
+    limit: () => ({ limit: agent.governor.limit(), configured: config.concurrency?.maxTurns ?? 0, auto: autoTurnLimit(machineFacts()) }),
+    setLimit: (configured) => {
+      config.concurrency = { ...(config.concurrency ?? {}), maxTurns: configured };
+      saveConfig(config);
+      agent.setConcurrentTurnLimit(resolveTurnLimit(configured, machineFacts()));
+    },
+  });
+  setWebResearchControls({
+    state: (id) => agent.researchMode.stateFor(id),
+    finish: (id) => agent.finishResearch(id),
+    off: (id) => { if (agent.researchMode.armedForSession(id)) agent.researchMode.setOff(); webChannel.sendResearchArmed(false, id); },
+  });
+  setWebBudgetControls({ config: () => config, tokens: () => tokenBudget, saver: () => agent.saverMode });
+  // Updates wait for running work: a reply, queued messages, bot turns.
+  {
+    const { setUpdateBusyProbe, reconcileUpdateJob } = await import('./updates/server-updater.js');
+    const { versionString } = await import('./web/api/status.js');
+    setUpdateBusyProbe(() => {
+      if (agent.processing) return 'a reply';
+      if (agent.queuedCount > 0) return agent.queuedCount === 1 ? 'a queued message' : `${agent.queuedCount} queued messages`;
+      const bots = botManager?.runningJobs() ?? 0;
+      if (bots > 0) return bots === 1 ? 'a bot run' : `${bots} bot runs`;
+      return null;
+    });
+    try { reconcileUpdateJob(versionString()); } catch (err) { logger.debug({ err }, 'updates: reconcile failed'); }
+  }
+  // Titles made before they were checked: fix them once, quietly, after start-up.
+  if (!daemonOwnsRuntime) {
+    const titleRepair = setTimeout(() => { void agent.repairSessionTitles().catch(() => {}); }, 20_000);
+    titleRepair.unref?.();
+  }
   setWebCurrentProvider(() => agent.getCurrentProvider());
+  // Live bottom bar for attached terminals and the dashboard: one snapshot,
+  // pushed on every model switch and checked every 2 s for anything else.
+  const statusSnapshot = (): Record<string, unknown> => {
+    const current = agent.getCurrentProvider();
+    return {
+      provider: getProviderLabel(current.name as ProviderName),
+      model: current.model,
+      mode: agent.programmingMode.getState(),
+      permission: webChannel.getSettings().bypassPermissions ? 'allow-all' : 'ask-me',
+      tokensUsed: tokenBudget.getDailyUsed(),
+      tokenBudget: tokenBudget.getBudget(),
+      desktop: liveStatus.desktop,
+    };
+  };
+  setWebStatusSnapshot(statusSnapshot);
+  let lastStatusKey = '';
+  const pushStatus = (): void => {
+    const snapshot = statusSnapshot();
+    const key = JSON.stringify(snapshot);
+    if (key === lastStatusKey) return;
+    lastStatusKey = key;
+    webChannel.broadcastStatus(snapshot);
+  };
+  setStatusPublisher(pushStatus);
+  setInterval(pushStatus, 2000).unref();
   // IDE provider registry powers features like commit message generation.
   // It does not require a supervisor, so wire it up unconditionally.
   setWebIDEProviders(providers);
@@ -3218,7 +3891,7 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     setWebSpotify(spotifyClient);
   }
 
-  capabilities.permissions.onAsk(async (prompt: string) => {
+  capabilities.permissions.onAsk(async (prompt: string, options) => {
     const channelType = capabilities.permissions.getCurrentChannelType();
     const { channelId } = capabilities.getChannelContext();
     if (channelType === 'telegram' && tgChannel) {
@@ -3228,7 +3901,12 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
       return (channels.get('signal') as SignalChannel).askPermission(prompt, channelId);
     }
     if (channelType === 'web' && webChannel) {
-      return webChannel.askPermission(prompt, channelId);
+      return webChannel.askPermission(prompt, channelId, options);
+    }
+    // Any other channel that can ask (plugin channels such as WhatsApp).
+    const asking = channels.get(channelType as Parameters<typeof channels.get>[0]) as { askPermission?: (p: string, id?: string) => Promise<string> } | undefined;
+    if (channelType !== 'cli' && typeof asking?.askPermission === 'function') {
+      return asking.askPermission(prompt, channelId);
     }
     if (cliChannel) {
       return cliChannel.askPermission(prompt);
@@ -3242,6 +3920,10 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
         capabilities.permissions.setAutoApproveAll(true);
         capabilities.permissions.addTempScope('/', true, true);
         logger.info({ chatId }, 'Telegram: Allow All mode set for session');
+      } else {
+        // Switching back used to be ignored: Allow All stayed on until restart.
+        capabilities.permissions.setAutoApproveAll(false);
+        logger.info({ chatId }, 'Telegram: Ask Me mode set for session');
       }
     });
   }
@@ -3252,6 +3934,10 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
         capabilities.permissions.setAutoApproveAll(true);
         capabilities.permissions.addTempScope('/', true, true);
         logger.info('Signal: Allow All mode set for session');
+      } else {
+        // Switching back used to be ignored: Allow All stayed on until restart.
+        capabilities.permissions.setAutoApproveAll(false);
+        logger.info('Signal: Ask Me mode set for session');
       }
     });
   }
@@ -3268,8 +3954,13 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     console.log(chalk.green(`  ${name} is live. Type a message and press Enter.`));
     console.log(chalk.dim('  Ctrl+C to exit · /help for commands'));
 
-    if (config.web.enabled) {
+    if (daemonOwnsRuntime) {
+      console.log(chalk.dim(`  Web, channels and bots are served by the background daemon (PID ${getDaemonStatus().pid}).`));
+    } else if (config.web.enabled) {
       startWebServer();
+      // Rotate the machine-local attach token for this boot so second
+      // terminals can connect without the web login flow.
+      writeAttachToken();
       updateWebStatus({
         running: true,
         pid: process.pid,
@@ -3316,15 +4007,30 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
       cliChannel.setCurrentSession(selected);
     }
 
-    const mode = cliChannel && await cliChannel.askPermissionMode?.();
+    // Every session starts by asking (also Mercury Code): the saved mode is
+    // listed first so Enter keeps it. The pick is remembered as the default
+    // for next time; /permissions changes it mid-session.
+    const savedMode = loadPermissionMode();
+    const mode = cliChannel && process.stdout.isTTY
+      ? await cliChannel.askPermissionMode(savedMode ?? undefined)
+      : savedMode ?? 'ask-me';
+    if ((mode === 'allow-all' || mode === 'ask-me') && process.stdout.isTTY) savePermissionMode(mode);
+    cliChannel?.setPermissionModeStatus(mode === 'allow-all' ? 'allow-all' : 'ask-me');
     if (mode === 'allow-all') {
       capabilities.permissions.setAutoApproveAll(true);
       capabilities.permissions.addTempScope('/', true, true);
     }
   } else {
-    await channels.startAll();
+    // Listener first: a second terminal attaches the moment the daemon is
+    // up, not after every channel and bot has booted. /api/health reports
+    // 'booting' until the rest is live.
     if (config.web.enabled) {
       startWebServer();
+      writeAttachToken();
+      updateWebStatus({ running: true, pid: process.pid, state: 'booting' });
+    }
+    await channels.startAll();
+    if (config.web.enabled) {
       updateWebStatus({
         running: true,
         pid: process.pid,
@@ -3363,12 +4069,21 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
         await agent.notifyAllChannels('⚠ Mercury is shutting down. If I was working on something, it has been interrupted. Send a message after restart to continue.');
       } catch { /* best effort */ }
       if (userMemory) {
+        // One last reflection pass over the sessions of this run (ADR-026);
+        // bounded so a slow provider cannot hold the shutdown.
         try {
-          userMemory.consolidate();
+          await Promise.race([agent.reflectNow(), new Promise<void>((resolve) => setTimeout(resolve, 20_000).unref())]);
+        } catch { /* best effort */ }
+        try {
           userMemory.close();
         } catch {}
       }
       await stopWebServer();
+      // Release the bots' SQLite queue handle — on Windows an open handle
+      // keeps queue.db locked against any later uninstall/replace.
+      try { botManager?.dispose(); } catch { /* best effort */ }
+      try { await mcpManager?.close(); } catch { /* best effort */ }
+      try { await pluginManager?.shutdown(); } catch { /* best effort */ }
       await agent.shutdown();
       clearCloudRuntimeOnline();
       releaseRuntimeProcess(runtimeMode);
@@ -3378,6 +4093,10 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // `mercury stop` / `restart` / `upgrade` ask over the local web API first
+  // (POST /api/shutdown) — on Windows that is the only way shutdown() runs,
+  // since process.kill there is TerminateProcess.
+  setShutdownHandler(() => { void shutdown(); });
 
   if (!isDaemon && process.platform !== 'win32') {
     process.on('SIGHUP', async () => {
@@ -3404,6 +4123,46 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
   }
 }
 
+/**
+ * Boot-time crash handlers (#64). Installed before any command runs — in
+ * particular before the setup wizard — so a failure there is loud and
+ * exits 1. Without them, web/server.ts's import-time `unhandledRejection`
+ * listener disables Node's default throw-on-rejection, and a rejected
+ * `configure()` (e.g. stdin closed mid-wizard) ended the process with
+ * exit code 0 and no message. runAgent() swaps these for its forensics
+ * handlers (crash-report.log) once the runtime boots.
+ */
+function describeBootError(err: unknown): string {
+  if (err instanceof Error) {
+    return process.env.MERCURY_DEBUG && err.stack ? err.stack : err.message;
+  }
+  return String(err);
+}
+function bootUncaughtException(err: unknown): void {
+  try { process.stderr.write(`\n✗ Mercury hit an unexpected error: ${describeBootError(err)}\n`); } catch { /* stderr gone */ }
+  process.exit(1);
+}
+function bootUnhandledRejection(reason: unknown): void {
+  if (reason instanceof InputClosedError) {
+    try { process.stderr.write(`\n✗ ${reason.message}\n`); } catch { /* stderr gone */ }
+    process.exit(1);
+  }
+  bootUncaughtException(reason);
+}
+function installBootCrashHandlers(): void {
+  process.on('uncaughtException', bootUncaughtException);
+  process.on('unhandledRejection', bootUnhandledRejection);
+}
+function removeBootCrashHandlers(): void {
+  process.off('uncaughtException', bootUncaughtException);
+  process.off('unhandledRejection', bootUnhandledRejection);
+}
+installBootCrashHandlers();
+
+// --safe-mode must reach the daemon child too, which is spawned with this
+// process's environment but its own argv.
+if (process.argv.includes('--safe-mode')) process.env.MERCURY_PLUGINS = 'off';
+
 const program = new Command();
 
 program
@@ -3411,14 +4170,30 @@ program
   .description('Mercury — Soul-driven AI agent with permission-hardened tools, token budgets, and multi-channel access.')
   .version(pkgVersion)
   .option('-v, --verbose', 'Show debug logs')
+  .option('--safe-mode', 'Start with every plugin turned off (also MERCURY_PLUGINS=off)')
   .action(async () => {
     if (!isSetupComplete()) {
       await configure();
       autoDaemonize();
       return;
     }
-    autoDaemonize();
-    await runAgent();
+    // A second terminal joins the running runtime instead of fighting it.
+    // THE DAEMON COUNTS: booting a full foreground runtime next to it gave
+    // two schedulers and two bot pollers on one queue.db — bots got called
+    // twice and fleet-creation turns raced. Attach instead.
+    const daemon = getDaemonStatus();
+    if (daemon.running && daemon.pid) {
+      console.log(chalk.cyan(`  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.`));
+      await attachOrHeal();
+      return;
+    }
+    const foreground = getForegroundRuntimeStatus();
+    if (foreground.running && foreground.pid) {
+      console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — attaching.`));
+      await attachOrHeal();
+      return;
+    }
+    await bootDaemonThenAttach();
   });
 
 program
@@ -3428,6 +4203,7 @@ program
   .option('-f, --foreground', 'Run in foreground (attached to terminal)')
   .option('-d, --detached', 'Run in background (daemon mode) — same as default')
   .option('--daemon', 'Internal flag for daemon child process')
+  .option('--safe-mode', 'Start with every plugin turned off')
   .action(async (opts) => {
     if (opts.daemon) {
       await runWithWatchdog(() => runAgent(true));
@@ -3441,11 +4217,31 @@ program
     }
 
     if (opts.foreground) {
+      // Same single-runtime rule: a live daemon is already "Mercury running".
+      const daemon = getDaemonStatus();
+      if (daemon.running && daemon.pid) {
+        console.log(chalk.cyan(`  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.`));
+        await attachOrHeal();
+        return;
+      }
+      const foreground = getForegroundRuntimeStatus();
+      if (foreground.running && foreground.pid) {
+        console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — attaching.`));
+        await attachOrHeal();
+        return;
+      }
       await runAgent();
       return;
     }
 
     startBackground();
+  });
+
+program
+  .command('attach')
+  .description('Attach this terminal to an already-running Mercury runtime (chat + live streaming)')
+  .action(async () => {
+    await attachOrCode({ exitOnFailure: true });
   });
 
 program
@@ -3515,7 +4311,29 @@ program
 program
   .command('setup')
   .description('Re-run the setup wizard (reconfigure)')
-  .action(async () => {
+  .option('--headless', 'No questions: write the minimum config with the dashboard enabled (used by Mercury Desktop)')
+  .option('--owner <name>', 'Owner name for --headless')
+  .option('--agent-name <name>', 'Agent name for --headless')
+  .option('--port <port>', 'Dashboard port for --headless')
+  .option('--json', 'With --headless: print the result as JSON')
+  .action(async (opts: { headless?: boolean; owner?: string; agentName?: string; port?: string; json?: boolean }) => {
+    if (opts.headless) {
+      const { applyHeadlessSetup } = await import('./cli/headless-setup.js');
+      const config = loadConfig();
+      const port = opts.port !== undefined ? Number(opts.port) : undefined;
+      const { changed } = applyHeadlessSetup(config, { owner: opts.owner, agentName: opts.agentName, port });
+      saveConfig(ensureCreatorField(config));
+      // The dashboard password exists from now on; shown once, like the wizard does.
+      const webAuth = initWebAuth();
+      const result = { ok: true, owner: config.identity.owner, agentName: config.identity.name, webPort: config.web.port, changed, username: webAuth.username, password: webAuth.password || null };
+      if (opts.json) {
+        console.log(JSON.stringify(result));
+      } else {
+        console.log(chalk.green(`  ✓ Mercury configured for ${config.identity.owner} · dashboard on port ${config.web.port}`));
+        if (webAuth.password) console.log(`  Dashboard login: ${webAuth.username} / ${webAuth.password}  ${chalk.dim('(shown once; change it in Settings)')}`);
+      }
+      return;
+    }
     if (isSetupComplete()) {
       await configure(loadConfig());
     } else {
@@ -3527,15 +4345,74 @@ program
   .command('doctor')
   .description('Reconfigure Mercury setup (name, providers, channels, permissions defaults)')
   .option('--platform', 'Show platform compatibility diagnostics')
+  .option('--storage', 'Show SQLite backend, database files and row counts')
+  .option('--mcp', 'Connect to each configured MCP server and report its status')
+  .option('--plugins', 'Check installed plugins and why any are turned off')
+  .option('--security', 'Check remote access and security (password, devices, file permissions, tunnel)')
   .action(async (opts) => {
+    if (opts.security) {
+      const { securityCheck, summarizeFindings } = await import('./security/check.js');
+      const { findingsText } = await import('./security/server-menu.js');
+      const findings = securityCheck({ cloudConnected: loadConfig().cloud?.enabled === true });
+      console.log(`\n  Security: ${summarizeFindings(findings)}\n`);
+      console.log(findingsText(findings).split('\n').map((l) => `  ${l}`).join('\n'));
+      console.log(chalk.dim('\n  Manage remote access with `mercury server` (or /server in the terminal chat).\n'));
+      if (findings.some((f) => f.level === 'risk')) process.exitCode = 1;
+      return;
+    }
+    {
+      // Keys that cannot be right — say so before anything is tried.
+      const { checkKeyShapes } = await import('./providers/key-shape.js');
+      const warnings = checkKeyShapes(loadConfig().providers as unknown as Record<string, { apiKey?: string; enabled?: boolean }>);
+      for (const w of warnings) console.log(chalk.yellow(`  ⚠ ${w.provider} API key looks wrong: ${w.problem}. Fix it with \`mercury doctor\` → providers, or in ~/.mercury/mercury.yaml.`));
+    }
     if (opts.platform) {
       runPlatformDoctor();
       return;
     }
+    if (opts.storage) {
+      runStorageDoctor();
+      return;
+    }
+    if (opts.mcp) {
+      const mcpDoctor = await runMcpDoctor(loadConfig().mcp);
+      for (const line of mcpDoctor.lines) console.log(line);
+      if (!mcpDoctor.ok) process.exitCode = 1;
+      return;
+    }
+    const mcpSummary = summarizeMcpConfig(loadConfig().mcp);
+    if (mcpSummary) console.log(chalk.dim(`  ${mcpSummary}`));
+    {
+      // One line about security on every doctor run; details with --security.
+      const { securityCheck, summarizeFindings } = await import('./security/check.js');
+      const findings = securityCheck({ cloudConnected: loadConfig().cloud?.enabled === true });
+      const summary = summarizeFindings(findings);
+      const line = `  Security: ${summary}${summary === 'All good' ? '' : ' — run `mercury doctor --security`'}`;
+      console.log(findings.some((f) => f.level === 'risk') ? chalk.yellow(line) : chalk.dim(line));
+    }
+    try {
+      // One line about updates: current, newest, required, blocked.
+      const { serverUpdateStatus } = await import('./updates/status.js');
+      const { updatesLine } = await import('./updates/notices.js');
+      const u = updatesLine(await serverUpdateStatus({ current: pkgVersion }));
+      console.log(u.level === 'risk' ? chalk.red(u.text) : u.level === 'note' ? chalk.yellow(u.text) : chalk.dim(u.text));
+    } catch { /* offline: say nothing */ }
+    if (opts.plugins) {
+      const { runPluginDoctor } = await import('./cli/plugins-cli.js');
+      await runPluginDoctor();
+      return;
+    }
+    // The daemon reads providers, keys and channels at boot: a reconfigure
+    // that only wrote the file looked like it did nothing until a manual
+    // `mercury restart`. Restart it ourselves when something changed.
+    const before = configFingerprint();
     if (isSetupComplete()) {
       await configure(loadConfig());
     } else {
       await configure();
+    }
+    if (configFingerprint() !== before) {
+      restartDaemonIfRunning('Applying your changes — restarting the background Mercury...');
     }
   });
 
@@ -4378,12 +5255,29 @@ serviceCmd
     showServiceStatus();
   });
 
-  program
+registerDevicesCli(program);
+registerServerCli(program);
+
+registerUpdateCli(program, pkgVersion);
+
+program
   .command('upgrade')
-  .description('Upgrade Mercury to the latest version')
-  .action(async () => {
-    console.log('');
-    console.log(chalk.cyan(`  Mercury ${chalk.white(`v${pkgVersion}`)}`));
+  .description('Upgrade Mercury to the latest version (goes back on its own if the new version fails)')
+  .option('--force', 'Reinstall even when already on the latest version')
+  .option('--check', 'Only show whether a newer version exists and what is in it')
+  .option('--now', "Don't wait for running work to finish")
+  .action(async (opts: { force?: boolean; check?: boolean; now?: boolean }) => {
+    await runUpgrade(pkgVersion, opts, legacyReinstall);
+  });
+
+/** `--force` on the newest version: re-run the installer (binary) or npm (npm install), as before. */
+async function legacyReinstall(): Promise<void> {
+    // A dev binary upgrades itself in place on the same channel (re-running
+    // the dev installer below); npm builds take the npm stable track.
+    if (isDevBuild(pkgVersion)) {
+      console.log(chalk.yellow('  ⚠ development build — upgrading within the dev channel (rolling mercury-dev-latest)'));
+      console.log('');
+    }
     console.log('');
 
     const daemon = getDaemonStatus();
@@ -4397,36 +5291,46 @@ serviceCmd
 
     if (standalone) {
       // Standalone binary: re-run the installer script which downloads the
-      // latest release from GitHub and replaces the binary in-place.
-      console.log(chalk.dim('  Standalone binary detected — re-running installer...'));
+      // latest release from GitHub and replaces the binary in-place. A dev
+      // build re-runs the DEV installer so `upgrade` stays on its channel —
+      // running the stable installer here would silently switch installs.
+      const isDev = isDevBuild(pkgVersion);
+      const installer = isDev ? 'install-dev' : 'install';
+      console.log(
+        isDev
+          ? chalk.dim('  Development build detected — re-running the dev installer (stays on the dev channel)...')
+          : chalk.dim('  Standalone binary detected — re-running installer...'),
+      );
       console.log('');
 
       const { execSync, spawn } = await import('node:child_process');
       const platform = process.platform;
 
       if (platform === 'win32') {
-        // Run after this process exits so Windows releases the current executable.
-        const psCmd = 'Start-Sleep -Seconds 1; irm https://mercuryagent.sh/install.ps1 | iex';
+        // Run after this process exits so Windows releases the current
+        // executable: wait on our pid (not a fixed sleep), and hand the pid
+        // to the installer so it can wait again before replacing the binary.
+        const psCmd = `$env:MERCURY_WAIT_PID='${process.pid}'; Wait-Process -Id ${process.pid} -Timeout 30 -ErrorAction SilentlyContinue; irm https://mercuryagent.sh/${installer}.ps1 | iex`;
         try {
-          const installer = spawn(
+          const installer2 = spawn(
             'powershell.exe',
             ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psCmd],
             { detached: true, stdio: 'inherit' },
           );
-          installer.unref();
+          installer2.unref();
           console.log(chalk.green('  ✓ Upgrade installer started. Mercury will exit before installation begins.'));
         } catch {
           console.log(chalk.red('  ✗ Upgrade failed. Try manually:'));
-          console.log(chalk.dim('    irm https://mercuryagent.sh/install.ps1 | iex'));
+          console.log(chalk.dim(`    irm https://mercuryagent.sh/${installer}.ps1 | iex`));
         }
       } else {
         // macOS / Linux: use shell installer
-        const shCmd = 'curl -fsSL https://mercuryagent.sh/install.sh | sh';
+        const shCmd = `curl -fsSL https://mercuryagent.sh/${installer}.sh | sh`;
         try {
           execSync(shCmd, { stdio: 'inherit' });
         } catch {
           console.log(chalk.red('  ✗ Upgrade failed. Try manually:'));
-          console.log(chalk.dim('    curl -fsSL https://mercuryagent.sh/install.sh | sh'));
+          console.log(chalk.dim(`    curl -fsSL https://mercuryagent.sh/${installer}.sh | sh`));
         }
       }
 
@@ -4449,6 +5353,21 @@ serviceCmd
 
     console.log(chalk.dim(`  Latest: v${latestVersion}`));
 
+    // Never remove a working install for one this Node cannot run: the old
+    // package is gone before `npm i -g` prints its engines warning.
+    if (!process.versions.bun) {
+      let required = '';
+      try { required = execSync(`npm view @cosmicstack/mercury-agent@${latestVersion} engines.node`, { encoding: 'utf-8' }).trim(); } catch { /* unknown — proceed */ }
+      const need = Number((required.match(/(\d+)/) || [])[1] || 0);
+      const have = Number(process.versions.node.split('.')[0]);
+      if (need && have < need) {
+        console.log(chalk.red(`  ✗ v${latestVersion} needs Node.js ${need}+ — this is Node ${process.version}. Nothing was changed.`));
+        console.log(chalk.dim(`    Upgrade Node first:  nvm install ${need} && nvm alias default ${need}`));
+        console.log(chalk.dim('    Then reinstall:      npm i -g @cosmicstack/mercury-agent'));
+        console.log('');
+        return;
+      }
+    }
     if (latestVersion === pkgVersion) {
       console.log(chalk.green(`  ✓ Already on the latest version (v${pkgVersion})`));
       console.log('');
@@ -4482,6 +5401,50 @@ serviceCmd
     }
 
     console.log('');
+  }
+
+program
+  .command('code')
+  .description('Open the Mercury Code TUI in a directory (default: current) with a fresh session')
+  .argument('[dir]', 'Directory to work in (defaults to the current one)')
+  .action(async (dirArg?: string) => {
+    const target = dirArg ? pathResolve(dirArg) : process.cwd();
+    if (!existsSync(target) || !statSync(target).isDirectory()) {
+      console.log(chalk.red(`  ✗ Not a directory: ${target}`));
+      console.log('');
+      process.exit(1);
+    }
+    // Consumed by runAgent() in the foreground process (the daemon child
+    // ignores it — only the TUI boots into Mercury Code).
+    process.env.MERCURY_BOOT_CODE = dirArg ? target : '1';
+    if (!isSetupComplete()) {
+      await configure();
+      delete process.env.MERCURY_BOOT_CODE;
+      autoDaemonize();
+      return;
+    }
+    const foreground = getForegroundRuntimeStatus();
+    if (foreground.running && foreground.pid) {
+      console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — \`mercury code\` needs its own runtime.`));
+      console.log(chalk.dim('  Stop it first: mercury stop  (or use /code inside the running TUI).'));
+      console.log('');
+      return;
+    }
+    // Mercury Code needs the in-process TUI. Beside the daemon it just
+    // spawned, runAgent() is a terminal for the main agent only (ADR-024).
+    autoDaemonize();
+    await runAgent();
+  });
+
+program
+  .command('uninstall')
+  .description('Fully remove Mercury from this machine (runtime, service, npm/binary artifacts)')
+  .option('--purge-data', 'Also delete all Mercury data (~/.mercury: memory, sessions, soul, keys) without asking')
+  .option('--keep-data', 'Keep all Mercury data (skips the confirmation prompt)')
+  .action(async (opts) => {
+    await runUninstall({
+      purgeData: opts.purgeData ? true : opts.keepData ? false : undefined,
+    });
   });
 
 program
@@ -4504,6 +5467,192 @@ program
     console.log('');
   });
 
+interface McpAddOptions {
+  stdio?: string;
+  http?: string;
+  env: string[];
+  header: string[];
+  cwd?: string;
+  allow?: string;
+  autoApprove?: string;
+  allowPrivate?: boolean;
+  disabled?: boolean;
+  yes?: boolean;
+}
+
+async function confirmMcp(question: string): Promise<boolean> {
+  try {
+    const answer = (await ask(chalk.white(`  ${question} [y/N] `))).trim().toLowerCase();
+    return answer === 'y' || answer === 'yes';
+  } catch (err) {
+    if (err instanceof InputClosedError) return false;
+    throw err;
+  }
+}
+
+function printMcpProbe(status: McpServerStatus): void {
+  const line = formatMcpStatusLine(status);
+  console.log(status.state === 'connected' ? chalk.green(`  ✓ ${line}`) : chalk.red(`  ✗ ${line}`));
+  if (status.state === 'connected') {
+    for (const toolLine of formatMcpToolLines(status)) console.log(chalk.dim(`    ${toolLine}`));
+  }
+  if (status.stderrTail) {
+    console.log(chalk.dim('  stderr:'));
+    for (const stderrLine of status.stderrTail.trim().split('\n').slice(-20)) console.log(chalk.dim(`    ${stderrLine}`));
+  }
+}
+
+function mcpAction<A extends unknown[]>(fn: (...args: A) => Promise<void> | void): (...args: A) => Promise<void> {
+  return async (...args: A) => {
+    try {
+      await fn(...args);
+    } catch (err) {
+      console.log(chalk.red(`  ${err instanceof Error ? err.message : String(err)}`));
+      console.log('');
+      process.exitCode = 1;
+    }
+  };
+}
+
+function saveMcpChange(config: MercuryConfig, message: string): void {
+  saveConfig(config);
+  console.log(chalk.green(`  ✓ ${message}`));
+  restartDaemonIfRunning('Restarting the background daemon to apply the change...');
+  console.log('');
+}
+
+const collectRepeated = (value: string, previous: string[]): string[] => [...previous, value];
+
+const mcpCmd = program.command('mcp').description('Manage MCP servers whose tools Mercury can use');
+
+mcpCmd
+  .command('list')
+  .description('Show configured MCP servers')
+  .action(mcpAction(() => {
+    console.log('');
+    for (const line of formatMcpServerList(loadConfig())) {
+      console.log(line.startsWith('  ') ? chalk.dim(`  ${line}`) : `  ${line}`);
+    }
+    console.log('');
+  }));
+
+mcpCmd
+  .command('add <id> [args...]')
+  .description('Add an MCP server: --stdio <command> [-- args...] or --http <url>')
+  .option('--stdio <command>', 'command that starts a local stdio server')
+  .option('--http <url>', 'Streamable HTTP endpoint of a remote server')
+  .option('--env <KEY=VALUE>', 'environment variable for a stdio server, ${env:NAME} for secrets (repeatable)', collectRepeated, [])
+  .option('--header <Name: value>', 'HTTP header, ${env:NAME} for secrets (repeatable)', collectRepeated, [])
+  .option('--cwd <dir>', 'working directory for a stdio server')
+  .option('--allow <tools>', 'comma-separated tools the agent may see, or *')
+  .option('--auto-approve <tools>', 'comma-separated tools that run without asking')
+  .option('--allow-private', 'allow a private or loopback address for an HTTP server')
+  .option('--disabled', 'save the server without enabling it')
+  .option('-y, --yes', 'do not ask for confirmation')
+  .action(mcpAction(async (id: string, args: string[], opts: McpAddOptions) => {
+    const config = loadConfig();
+    const server = buildMcpServerConfig({ ...opts, args });
+    const warnings = addMcpServer(config, id, server);
+    console.log('');
+    for (const warning of warnings) console.log(chalk.yellow(`  ⚠ ${warning}`));
+    if (server.transport === 'stdio') {
+      console.log(chalk.white(`  Mercury will start this command: ${formatMcpStdioCommand(server)}`));
+      if (!opts.yes && !(await confirmMcp('Add this server?'))) {
+        console.log(chalk.dim('  Cancelled.'));
+        console.log('');
+        return;
+      }
+    }
+    if (server.enabled !== false) {
+      console.log(chalk.dim('  Testing the connection...'));
+      const status = await probeMcpServer(id, server);
+      printMcpProbe(status);
+      if (status.state !== 'connected' && !opts.yes && !(await confirmMcp('Save it anyway?'))) {
+        console.log(chalk.dim('  Cancelled.'));
+        console.log('');
+        return;
+      }
+    }
+    if (!server.tools?.allow?.length) {
+      console.log(chalk.dim(`  No tools are enabled yet. Enable some with \`mercury mcp allow ${id} <tool...>\`.`));
+    }
+    saveMcpChange(config, `MCP server "${id}" saved.`);
+  }));
+
+mcpCmd
+  .command('remove <id>')
+  .description('Remove an MCP server')
+  .action(mcpAction((id: string) => {
+    const config = loadConfig();
+    removeMcpServer(config, id);
+    console.log('');
+    saveMcpChange(config, `MCP server "${id}" removed.`);
+  }));
+
+mcpCmd
+  .command('enable <id>')
+  .description('Enable an MCP server')
+  .option('-y, --yes', 'do not ask for confirmation')
+  .action(mcpAction(async (id: string, opts: { yes?: boolean }) => {
+    const config = loadConfig();
+    const server = getMcpServer(config, id);
+    console.log('');
+    if (server.transport === 'stdio') {
+      console.log(chalk.white(`  Mercury will start this command: ${formatMcpStdioCommand(server)}`));
+      if (!opts.yes && !(await confirmMcp('Enable this server?'))) {
+        console.log(chalk.dim('  Cancelled.'));
+        console.log('');
+        return;
+      }
+    }
+    setMcpServerEnabled(config, id, true);
+    saveMcpChange(config, `MCP server "${id}" enabled.`);
+  }));
+
+mcpCmd
+  .command('disable <id>')
+  .description('Disable an MCP server without removing it')
+  .action(mcpAction((id: string) => {
+    const config = loadConfig();
+    setMcpServerEnabled(config, id, false);
+    console.log('');
+    saveMcpChange(config, `MCP server "${id}" disabled.`);
+  }));
+
+mcpCmd
+  .command('allow <id> <tools...>')
+  .description('Let the agent see these tools (quote "*" to allow all)')
+  .action(mcpAction((id: string, tools: string[]) => {
+    const config = loadConfig();
+    const server = allowMcpTools(config, id, tools);
+    console.log('');
+    saveMcpChange(config, `${id}: allowed ${server.tools?.allow?.join(', ') || 'nothing'}.`);
+  }));
+
+mcpCmd
+  .command('disallow <id> <tools...>')
+  .description('Hide these tools from the agent')
+  .action(mcpAction((id: string, tools: string[]) => {
+    const config = loadConfig();
+    const server = disallowMcpTools(config, id, tools);
+    console.log('');
+    const deny = server.tools?.deny?.length ? `, denied ${server.tools.deny.join(', ')}` : '';
+    saveMcpChange(config, `${id}: allowed ${server.tools?.allow?.join(', ') || 'nothing'}${deny}.`);
+  }));
+
+mcpCmd
+  .command('test <id>')
+  .description('Connect to an MCP server and list its tools')
+  .action(mcpAction(async (id: string) => {
+    const server = getMcpServer(loadConfig(), id);
+    console.log('');
+    const status = await probeMcpServer(id, server);
+    printMcpProbe(status);
+    console.log('');
+    if (status.state !== 'connected') process.exitCode = 1;
+  }));
+registerPluginsCli(program);
+
 const cloud = program.command('cloud').description('Manage Mercury Cloud connection');
 
 cloud
@@ -4524,6 +5673,14 @@ cloud
     // immediately. The background daemon (started by runCloudConnect) keeps
     // the WebSocket alive even after the user exits the foreground.
     if (isSetupComplete()) {
+      // runCloudConnect (re)starts the daemon — join IT, never boot a second
+      // runtime next to it (two schedulers would call bots in lockstep).
+      const daemon = getDaemonStatus();
+      if (daemon.running && daemon.pid) {
+        console.log(chalk.cyan(`\n  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.\n`));
+        await attachOrHeal();
+        return;
+      }
       console.log(chalk.cyan('\n  Launching Mercury...\n'));
       await runAgent();
     } else {
@@ -4575,5 +5732,7 @@ cloud
   });
 
 registerSkillsCommand(program);
+registerBotsCommand(program);
+registerGoogleCommand(program);
 
 program.parse();

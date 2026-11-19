@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { planArgvExecution, minimalEnv } from '../capabilities/shell/argv-lane.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
@@ -101,6 +102,7 @@ export class BackgroundTaskManager {
   private sigkillTimeouts: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private onCompleteCallbacks: Map<string, TaskCompleteCallback> = new Map();
   private globalOnComplete?: TaskCompleteCallback;
+  private completeListeners = new Set<TaskCompleteCallback>();
   private pruneInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
@@ -129,6 +131,12 @@ export class BackgroundTaskManager {
     this.globalOnComplete = cb;
   }
 
+  /** Another listener for every finished task (e.g. calls from Mercury, ADR-046). Returns the unsubscribe function. */
+  onAnyComplete(cb: TaskCompleteCallback): () => void {
+    this.completeListeners.add(cb);
+    return () => { this.completeListeners.delete(cb); };
+  }
+
   spawnShell(command: string, cwd: string, timeoutMs: number = DEFAULT_SHELL_TIMEOUT_MS): string {
     this.enforceTaskLimit();
 
@@ -150,11 +158,17 @@ export class BackgroundTaskManager {
     this.save();
 
     try {
-      const child = spawn(command, [], {
-        cwd,
-        shell: true,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      // Same lane split as run_command: a command the argv lane can express
+      // runs via execFile from the pinned PATH with a minimal env; only the
+      // rest (already approved by the caller's checkShellCommand) uses a shell.
+      const plan = planArgvExecution(command);
+      const child = plan?.kind === 'exec'
+        ? spawn(plan.file, plan.args, { cwd, env: minimalEnv(), shell: false, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+        : spawn(command, [], {
+          cwd,
+          shell: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
 
       task.pid = child.pid ?? undefined;
       this.processes.set(id, child);
@@ -388,6 +402,9 @@ export class BackgroundTaskManager {
     }
     if (this.globalOnComplete) {
       try { this.globalOnComplete(task); } catch {}
+    }
+    for (const l of this.completeListeners) {
+      try { l(task); } catch { /* a listener's problem */ }
     }
   }
 

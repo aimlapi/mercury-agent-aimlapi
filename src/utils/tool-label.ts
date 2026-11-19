@@ -8,6 +8,8 @@ const TOOL_LABELS: Record<string, { icon: string; label: string; argKey?: string
   edit_file: { icon: '✂️', label: 'Editing', argKey: 'path', argTransform: basename },
   delete_file: { icon: '🗑', label: 'Deleting', argKey: 'path', argTransform: basename },
   list_dir: { icon: '📂', label: 'Listing', argKey: 'path', argTransform: basename },
+  list_mcp_resources: { icon: '🔌', label: 'Listing MCP resources', argKey: 'server' },
+  read_mcp_resource: { icon: '🔌', label: 'Reading MCP resource', argKey: 'uri', argTransform: truncate(60) },
   approve_scope: { icon: '🔓', label: 'Approving scope' },
   run_command: { icon: '⌨', label: 'Running command', argKey: 'command', argTransform: truncate(40) },
   cd: { icon: '📂', label: 'Changing dir to', argKey: 'path' },
@@ -54,7 +56,8 @@ function truncate(maxLen: number): (v: string) => string {
 export function formatToolStep(toolName: string, args: Record<string, any>): string {
   const config = TOOL_LABELS[toolName];
   if (!config) {
-    return toolName;
+    const mcp = /^mcp__([a-z][a-z0-9-]*)__(.+)$/.exec(toolName);
+    return mcp ? `🔌 ${mcp[1]} › ${mcp[2]}` : toolName;
   }
 
   let detail = '';

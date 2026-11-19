@@ -1,10 +1,12 @@
 import { createOpenAI } from '@ai-sdk/openai';
+import { wrapLanguageModel } from 'ai';
 import { BaseProvider } from './base.js';
 import type { ProviderConfig } from '../utils/config.js';
 import type { LLMResponse, LLMStreamChunk } from './base.js';
 import { getValidChatGPTSession, getChatGPTSession } from '../auth/chatgpt-auth.js';
 import { CHATGPT_BACKEND_API } from '../auth/chatgpt-session.js';
 import { logger } from '../utils/logger.js';
+import { applyReasoningToBody, effectiveReasoning } from '../utils/model-prefs.js';
 
 // Fields the codex endpoint does not accept
 const UNSUPPORTED_FIELDS = [
@@ -16,8 +18,13 @@ const UNSUPPORTED_FIELDS = [
 /**
  * Sanitise an outgoing request body for the ChatGPT codex/responses endpoint.
  */
-function sanitiseBody(raw: string): string {
+function sanitiseBody(raw: string, providerName: string): string {
   const body = JSON.parse(raw);
+
+  // User-chosen reasoning level for this model (dashboard reasoning picker),
+  // and a summary of the reasoning so a screen can show the model thinking
+  // (the Codex backend serves summaries on every ChatGPT plan).
+  if (typeof body.model === 'string') applyReasoningToBody(body, effectiveReasoning(providerName, body.model), { summary: true });
 
   // Required
   body.store = false;
@@ -39,7 +46,7 @@ function sanitiseBody(raw: string): string {
  * so we reconstruct it from intermediate events.
  * Returns a synthetic JSON Response so the SDK's doGenerate can parse it.
  */
-async function sseToJsonResponse(sseResponse: Response): Promise<Response> {
+export async function sseToJsonResponse(sseResponse: Response): Promise<Response> {
   const text = await sseResponse.text();
   const lines = text.split('\n');
 
@@ -62,6 +69,23 @@ async function sseToJsonResponse(sseResponse: Response): Promise<Response> {
       case 'response.output_item.added':
         if (parsed.item) {
           outputItems[parsed.output_index] = { ...parsed.item, content: [] };
+        }
+        break;
+      case 'response.output_item.done':
+        // The finished item: a tool call's arguments and a reasoning item's
+        // encrypted content only arrive here (when added, a call's arguments
+        // are still ""). Keep text already collected if this one has none.
+        if (parsed.item && parsed.output_index !== undefined) {
+          const prev = outputItems[parsed.output_index];
+          const content = Array.isArray(parsed.item.content) && parsed.item.content.length ? parsed.item.content : prev?.content ?? [];
+          outputItems[parsed.output_index] = { ...prev, ...parsed.item, content };
+        }
+        break;
+      case 'response.function_call_arguments.done':
+        // Older streams may finish a call's arguments without an item.done.
+        if (parsed.output_index !== undefined && typeof parsed.arguments === 'string') {
+          const item = outputItems[parsed.output_index];
+          if (item) item.arguments = parsed.arguments;
         }
         break;
       case 'response.output_text.done':
@@ -175,7 +199,7 @@ export class ChatGPTWebProvider extends BaseProvider {
             } catch { /* ignore */ }
 
             try {
-              modifiedInit.body = sanitiseBody(init.body);
+              modifiedInit.body = sanitiseBody(init.body, this.name);
             } catch { /* pass through */ }
           }
 
@@ -192,8 +216,29 @@ export class ChatGPTWebProvider extends BaseProvider {
         },
       });
 
-      // Use the Responses API (not Chat Completions)
-      this.cachedModelInstance = client.responses(this.model as any);
+      // Use the Responses API (not Chat Completions). The codex endpoint only
+      // works with store:false (sanitiseBody forces it), so the SDK must know
+      // too: otherwise it replays earlier reasoning/tool items as
+      // `item_reference` ids, which the server rejects as "not found" on the
+      // first call after a tool runs. Requesting encrypted reasoning lets
+      // those items be sent back inline instead, as the Codex CLI does.
+      this.cachedModelInstance = wrapLanguageModel({
+        model: client.responses(this.model as any),
+        middleware: {
+          specificationVersion: 'v3',
+          transformParams: async ({ params }) => {
+            const openai = (params.providerOptions?.openai ?? {}) as { include?: string[] } & Record<string, unknown>;
+            const include = new Set<string>([...(openai.include ?? []), 'reasoning.encrypted_content']);
+            return {
+              ...params,
+              providerOptions: {
+                ...params.providerOptions,
+                openai: { ...openai, store: false, include: [...include] },
+              },
+            };
+          },
+        },
+      });
     }
 
     return this.cachedModelInstance;

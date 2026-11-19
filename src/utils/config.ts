@@ -3,7 +3,9 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { config as loadDotenv } from 'dotenv';
+import { logger } from './logger.js';
 import type { SignalAccessUser, SignalPendingRequest, DiscordAccessUser, DiscordPendingRequest, SlackAccessUser, SlackPendingRequest } from '../types/channel.js';
+import type { McpConfig } from '../capabilities/mcp/types.js';
 import {
   LEGACY_SEED_API_URL,
   LEGACY_SEED_WS_URL,
@@ -33,6 +35,20 @@ export interface ProviderConfig {
   baseUrl: string;
   model: string;
   enabled: boolean;
+  /** Optional per-provider cap on output tokens per request. */
+  maxOutputTokens?: number;
+  /**
+   * The owner says this endpoint's model reads images. `modelSeesImages` otherwise
+   * guesses from the model name, which cannot know about a self-hosted model — a
+   * local Qwen-VL called `qwen3.8-flash-next` was refused for that reason.
+   */
+  vision?: boolean;
+  /**
+   * HTTP Basic credentials for a server behind a reverse proxy. When `username`
+   * is set, Mercury sends `Authorization: Basic ...` instead of the Bearer key.
+   */
+  username?: string;
+  password?: string;
 }
 
 export interface TelegramAccessUser {
@@ -61,13 +77,18 @@ export type ProviderName =
   | 'deepseek'
   | 'grok'
   | 'atlascloud'
+  | 'runcrate'
+  | 'cloudgpu'
   | 'ollamaCloud'
   | 'ollamaLocal'
+  | 'atomicChat'
   | 'openaiCompat'
   | 'mimo'
   | 'mimoTokenPlan'
+  | 'lmStudio'
   | 'chatgptWeb'
-  | 'githubCopilot';
+  | 'githubCopilot'
+  | 'litellm';
 
 export interface CloudConfig {
   enabled: boolean;
@@ -86,6 +107,11 @@ export interface MercuryConfig {
     name: string;
     owner: string;
     creator?: string;
+    /**
+     * Background Mercury should always know and can talk about: who made it,
+     * the team, what it's for. Included in every chat and call.
+     */
+    about?: string;
   };
   cloud: CloudConfig;
   providers: {
@@ -97,13 +123,18 @@ export interface MercuryConfig {
     deepseek: ProviderConfig;
     grok: ProviderConfig;
     atlascloud: ProviderConfig;
+    runcrate: ProviderConfig;
+    cloudgpu: ProviderConfig;
     ollamaCloud: ProviderConfig;
     ollamaLocal: ProviderConfig;
+    atomicChat: ProviderConfig;
     openaiCompat: ProviderConfig;
     mimo: ProviderConfig;
     mimoTokenPlan: ProviderConfig;
+    lmStudio: ProviderConfig;
     chatgptWeb: ProviderConfig;
     githubCopilot: ProviderConfig;
+    litellm: ProviderConfig;
   };
   channels: {
     telegram: {
@@ -171,6 +202,16 @@ export interface MercuryConfig {
        *  true when the agent is paired with Mercury Cloud. */
       poolSearch?: boolean;
     };
+    /** The Owner Model's learning calls (ADR-026): per-turn extraction and the reflection pass. */
+    learning?: {
+      /**
+       * Provider to run extraction and reflection on, by name from `providers`.
+       * Unset (or not usable) → the default chat provider. These are strict
+       * JSON tasks, so a capable mid-tier model (e.g. anthropic with a Haiku
+       * model) learns far better than a free tier.
+       */
+      provider?: string;
+    };
   };
   heartbeat: {
     intervalMinutes: number;
@@ -185,11 +226,64 @@ export interface MercuryConfig {
     saverAutoEnabled?: boolean;
     /** Lifetime estimated tokens saved by saver mode (informational). */
     saverTokensSavedLifetime?: number;
+    /**
+     * How much one cache-hit input token counts toward `dailyBudget`, 0–1.
+     * Default 1: every token counts. 0.1 roughly tracks cost, since providers
+     * bill cache hits at a fraction of the input price. Out-of-range values
+     * are clamped; anything non-numeric counts as 1.
+     */
+    cachedWeight?: number;
   };
   subagents: {
     enabled: boolean;
     maxConcurrent: number;
     mode: 'auto' | 'manual';
+  };
+  bots: {
+    enabled: boolean;
+    /** 0 = auto (clamp(2, cpus-1)). Fleet-wide cap on concurrent bot turns. */
+    maxConcurrent: number;
+    /** Shared secret for POST /api/bots/:id/hooks/* (unset = session auth only). */
+    webhookSecret?: string;
+    /** Auto-skill synthesis: draft SKILL.md from completed multi-step bot runs. */
+    autoSkill?: {
+      enabled?: boolean;
+    };
+    /** Fleet hierarchies: lead bots managing a crew of sub-bots. */
+    fleets?: {
+      /** Hard cap on crew size per lead (CrewAI guidance: 3-6 for delegation accuracy). */
+      maxCrew?: number;
+      /** Lead bots may create/remove their own crew via bot_spawn/bot_retire. */
+      allowLeadSpawn?: boolean;
+      /** Provider crew bots use when their manifest sets none (a cheaper lane for stage work). ADR-021. */
+      crewProvider?: string;
+    };
+    /** Per-bot daily token cap applied when a bot sets none (0 = unlimited). ADR-020. */
+    suggestedDailyTokenBudget?: number;
+    /** Fleet-wide daily token cap across all bots (0 = unlimited). ADR-020. */
+    fleetDailyTokenBudget?: number;
+    /** Fewest minutes between two runs of any bot routine (default 15). */
+    routineMinGapMinutes?: number;
+    /** How long a bot waits for the owner to answer its question before it's a no (default 10, max 60). */
+    approvalWaitMinutes?: number;
+    /** Owner-visible folder for finished results (default: ~/Documents/Mercury). */
+    deliverablesDir?: string;
+    retention: {
+      transcriptRuns: number;
+      journalRotateBytes: number;
+      journalKeepRotations: number;
+      mailboxTtlHours: number;
+      dlqCap: number;
+      artifactQuotaBytes: number;
+      /** Retention janitor for the fleet-shared folder (disabled = never sweep). */
+      sandboxJanitor: {
+        enabled: boolean;
+        /** Days a file stays in the working surface. */
+        hotDays: number;
+        /** Days an archived file survives before deletion. */
+        archiveDays: number;
+      };
+    };
   };
   spotify: {
     enabled: boolean;
@@ -208,6 +302,32 @@ export interface MercuryConfig {
   web: {
     enabled: boolean;
     port: number;
+    /**
+     * Extra browser origins allowed to call /api/* with a Bearer token
+     * (CORS). Mercury Desktop's own origins are always allowed; list a
+     * self-hosted web build or a dev server here. Never '*'.
+     */
+    corsOrigins?: string[];
+    /**
+     * Host names this server may be reached by directly, besides localhost —
+     * only for a proxy of your own that rewrites Host and adds no forwarding
+     * headers. Anything else is refused (DNS rebinding).
+     */
+    allowedHosts?: string[];
+  };
+  mcp?: McpConfig;
+  /** Opt-in: discover plugin and MCP schemas on demand in the main agent's tool loop. */
+  toolDiscovery?: { enabled?: boolean };
+  /**
+   * Chat turns running at once (ADR-037). One turn per chat at a time; this
+   * caps how many chats are worked on together. 0 = automatic (from heap
+   * size, RAM and platform; 2 on Termux). The turn governor admits fewer
+   * while memory is tight.
+   */
+  concurrency?: { maxTurns?: number };
+  /** Where the files Mercury makes go (default ~/mercury-artifacts): Research/ and one folder per chat. */
+  artifacts?: {
+    outputDir?: string;
   };
 }
 
@@ -227,6 +347,21 @@ function getEnvBool(key: string, fallback: boolean): boolean {
   return fallback;
 }
 
+/**
+ * A capability the owner declares, where "not set" is a third state.
+ *
+ * `getEnvBool(key, false)` would answer `false` for a variable nobody set, and a `false` is a
+ * declaration: it switches images off for a model whose name the guesser would have accepted
+ * (`gpt-4o` behind a gateway). Undefined means "nothing declared", so the name-based guess in
+ * `modelSeesImages` still applies.
+ */
+function getEnvOptionalBool(key: string): boolean | undefined {
+  const val = process.env[key]?.toLowerCase();
+  if (val === 'true') return true;
+  if (val === 'false') return false;
+  return undefined;
+}
+
 export function getDefaultConfig(): MercuryConfig {
   const home = getMercuryHome();
   const cloudApiUrl = getEnv('MERCURY_CLOUD_API_URL', MERCURY_CLOUD_API_URL);
@@ -236,6 +371,7 @@ export function getDefaultConfig(): MercuryConfig {
       name: getEnv('MERCURY_NAME', 'Mercury'),
       owner: getEnv('MERCURY_OWNER', ''),
       creator: getEnv('MERCURY_CREATOR', ''),
+      about: getEnv('MERCURY_ABOUT', ''),
     },
     cloud: {
       enabled: getEnvBool('MERCURY_CLOUD_ENABLED', false),
@@ -284,6 +420,7 @@ export function getDefaultConfig(): MercuryConfig {
         baseUrl: getEnv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1'),
         model: getEnv('DEEPSEEK_MODEL', 'deepseek-chat'),
         enabled: getEnvBool('DEEPSEEK_ENABLED', true),
+        ...(getEnv('DEEPSEEK_MAX_OUTPUT_TOKENS', '') ? { maxOutputTokens: Number(getEnv('DEEPSEEK_MAX_OUTPUT_TOKENS', '')) } : {}),
       },
       grok: {
         name: 'grok',
@@ -299,6 +436,20 @@ export function getDefaultConfig(): MercuryConfig {
         model: getEnv('ATLASCLOUD_MODEL', 'qwen/qwen3.5-flash'),
         enabled: getEnvBool('ATLASCLOUD_ENABLED', true),
       },
+      runcrate: {
+        name: 'runcrate',
+        apiKey: getEnv('RUNCRATE_API_KEY', ''),
+        baseUrl: getEnv('RUNCRATE_BASE_URL', 'https://api.runcrate.ai/v1'),
+        model: getEnv('RUNCRATE_MODEL', 'deepseek-ai/DeepSeek-V4.1-Flash'),
+        enabled: getEnvBool('RUNCRATE_ENABLED', true),
+      },
+      cloudgpu: {
+        name: 'cloudgpu',
+        apiKey: getEnv('CLOUDGPU_API_KEY', ''),
+        baseUrl: getEnv('CLOUDGPU_BASE_URL', 'https://cloudgpu.app/v1'),
+        model: getEnv('CLOUDGPU_MODEL', 'deepseek-v4.1-flash'),
+        enabled: getEnvBool('CLOUDGPU_ENABLED', true),
+      },
       ollamaCloud: {
         name: 'ollamaCloud',
         apiKey: getEnv('OLLAMA_CLOUD_API_KEY', ''),
@@ -313,12 +464,20 @@ export function getDefaultConfig(): MercuryConfig {
         model: getEnv('OLLAMA_LOCAL_MODEL', ''),
         enabled: getEnvBool('OLLAMA_LOCAL_ENABLED', false),
       },
+      atomicChat: {
+        name: 'atomicChat',
+        apiKey: '',
+        baseUrl: getEnv('ATOMIC_CHAT_BASE_URL', 'http://127.0.0.1:1337/v1'),
+        model: getEnv('ATOMIC_CHAT_MODEL', ''),
+        enabled: getEnvBool('ATOMIC_CHAT_ENABLED', false),
+      },
       openaiCompat: {
         name: 'openaiCompat',
         apiKey: getEnv('OPENAI_COMPAT_API_KEY', ''),
         baseUrl: getEnv('OPENAI_COMPAT_BASE_URL', ''),
         model: getEnv('OPENAI_COMPAT_MODEL', ''),
         enabled: getEnvBool('OPENAI_COMPAT_ENABLED', false),
+        vision: getEnvOptionalBool('OPENAI_COMPAT_VISION'),
       },
       mimo: {
         name: 'mimo',
@@ -334,6 +493,14 @@ export function getDefaultConfig(): MercuryConfig {
         model: getEnv('MIMO_TOKEN_PLAN_MODEL', 'mimo-v2.5-pro'),
         enabled: getEnvBool('MIMO_TOKEN_PLAN_ENABLED', false),
       },
+      lmStudio: {
+        name: 'lmStudio',
+        apiKey: getEnv('LM_STUDIO_API_KEY', ''),
+        vision: getEnvOptionalBool('LM_STUDIO_VISION'),
+        baseUrl: getEnv('LM_STUDIO_BASE_URL', 'http://127.0.0.1:1234/v1'),
+        model: getEnv('LM_STUDIO_MODEL', ''),
+        enabled: getEnvBool('LM_STUDIO_ENABLED', false),
+      },
       chatgptWeb: {
         name: 'chatgptWeb',
         apiKey: '', // not used — auth is via OAuth
@@ -347,6 +514,14 @@ export function getDefaultConfig(): MercuryConfig {
         baseUrl: '', // dynamic — resolved from Copilot token exchange
         model: getEnv('GITHUB_COPILOT_MODEL', 'gpt-4o'),
         enabled: getEnvBool('GITHUB_COPILOT_ENABLED', false),
+      },
+      litellm: {
+        name: 'litellm',
+        apiKey: getEnv('LITELLM_API_KEY', ''),
+        baseUrl: getEnv('LITELLM_BASE_URL', 'http://localhost:4000/v1'),
+        model: getEnv('LITELLM_MODEL', 'gpt-4o-mini'),
+        enabled: getEnvBool('LITELLM_ENABLED', false),
+        vision: getEnvOptionalBool('LITELLM_VISION'),
       },
     },
     channels: {
@@ -411,6 +586,9 @@ export function getDefaultConfig(): MercuryConfig {
         shareLearning: getEnvBool('SHARE_LEARNING', false),
         poolSearch: getEnvBool('POOL_SEARCH', true),
       },
+      learning: {
+        ...(process.env.LEARNING_PROVIDER ? { provider: process.env.LEARNING_PROVIDER } : {}),
+      },
     },
     heartbeat: {
       intervalMinutes: getEnvNum('HEARTBEAT_INTERVAL_MINUTES', 60),
@@ -422,6 +600,35 @@ export function getDefaultConfig(): MercuryConfig {
       enabled: getEnvBool('SUBAGENTS_ENABLED', true),
       maxConcurrent: getEnvNum('SUBAGENTS_MAX_CONCURRENT', 0),
       mode: (process.env.SUBAGENTS_MODE as 'auto' | 'manual') || 'auto',
+    },
+    bots: {
+      enabled: getEnvBool('BOTS_ENABLED', true),
+      maxConcurrent: getEnvNum('BOTS_MAX_CONCURRENT', 0),
+      webhookSecret: getEnv('BOTS_WEBHOOK_SECRET') || undefined,
+      autoSkill: {
+        enabled: getEnvBool('BOTS_AUTO_SKILL', false),
+      },
+      fleets: {
+        maxCrew: getEnvNum('BOTS_FLEET_MAX_CREW', 6),
+        allowLeadSpawn: getEnvBool('BOTS_FLEET_LEAD_SPAWN', true),
+        crewProvider: getEnv('BOTS_FLEET_CREW_PROVIDER') || undefined,
+      },
+      suggestedDailyTokenBudget: getEnvNum('BOTS_SUGGESTED_DAILY_TOKEN_BUDGET', 5_000_000),
+      fleetDailyTokenBudget: getEnvNum('BOTS_FLEET_DAILY_TOKEN_BUDGET', 20_000_000),
+      deliverablesDir: getEnv('BOTS_DELIVERABLES_DIR') || undefined,
+      retention: {
+        transcriptRuns: getEnvNum('BOTS_RETENTION_TRANSCRIPT_RUNS', 50),
+        journalRotateBytes: getEnvNum('BOTS_JOURNAL_ROTATE_BYTES', 5 * 1024 * 1024),
+        journalKeepRotations: getEnvNum('BOTS_JOURNAL_KEEP_ROTATIONS', 3),
+        mailboxTtlHours: getEnvNum('BOTS_MAILBOX_TTL_HOURS', 72),
+        dlqCap: getEnvNum('BOTS_DLQ_CAP', 100),
+        artifactQuotaBytes: getEnvNum('BOTS_ARTIFACT_QUOTA_BYTES', 500 * 1024 * 1024),
+        sandboxJanitor: {
+          enabled: getEnvBool('BOTS_SANDBOX_JANITOR', true),
+          hotDays: getEnvNum('BOTS_SANDBOX_HOT_DAYS', 7),
+          archiveDays: getEnvNum('BOTS_SANDBOX_ARCHIVE_DAYS', 30),
+        },
+      },
     },
     spotify: {
       enabled: getEnvBool('SPOTIFY_ENABLED', false),
@@ -437,6 +644,8 @@ export function getDefaultConfig(): MercuryConfig {
       accountId: '',
       product: '',
     },
+    toolDiscovery: { enabled: getEnvBool('MERCURY_TOOL_DISCOVERY', false) },
+    concurrency: { maxTurns: getEnvNum('MERCURY_MAX_CONCURRENT_TURNS', 0) },
     web: {
       enabled: getEnvBool('MERCURY_WEB_ENABLED', false),
       port: getEnvNum('MERCURY_PORT', 6174),
@@ -455,19 +664,52 @@ export function loadConfig(): MercuryConfig {
     const raw = readFileSync(CONFIG_PATH, 'utf-8');
     const fileConfig = parseYaml(raw) as Partial<MercuryConfig>;
     const defaults = getDefaultConfig();
-    return normalizeCloudConfig(migrateLegacyDiscordAccess(
-      migrateLegacyOllamaLocalBaseUrl(
-        migrateLegacyOllamaCloudBaseUrl(
-          migrateLegacySignalAccess(
-            migrateLegacyTelegramAccess(deepMerge(defaults, fileConfig)),
+    return normalizeCloudConfig(migrateLegacyChatGPTModel(
+      migrateLegacyDiscordAccess(
+        migrateLegacyOllamaLocalBaseUrl(
+          migrateLegacyOllamaCloudBaseUrl(
+            migrateLegacySignalAccess(
+              migrateLegacyTelegramAccess(deepMerge(defaults, fileConfig)),
+            ),
           ),
         ),
       ),
     ));
   }
-  return normalizeCloudConfig(migrateLegacyDiscordAccess(
-    migrateLegacyTelegramAccess(getDefaultConfig()),
+  return normalizeCloudConfig(migrateLegacyChatGPTModel(
+    migrateLegacyDiscordAccess(
+      migrateLegacyTelegramAccess(getDefaultConfig()),
+    ),
   ));
+}
+
+/**
+ * 2026-09: OpenAI's Codex-for-ChatGPT backend now validates the model slug
+ * against the account's LIVE entitlements and rejects everything else with
+ * HTTP 400 "The 'X' model is not supported when using Codex with a ChatGPT
+ * account." The old catalog fetched the ChatGPT web-app list
+ * (/backend-api/models), whose hyphenated slugs (e.g. `gpt-5-6-thinking`) are
+ * ALL rejected — authenticated users could not chat. Migrate any
+ * non-entitled chatgptWeb model to the current recommended Codex slug.
+ */
+const CHATGPT_CODEX_MODEL_SLUGS = [
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5',
+  'gpt-6-astra',
+  'gpt-reserve',
+] as const;
+
+const DEFAULT_CHATGPT_CODEX_MODEL = 'gpt-5.6-sol';
+
+export function migrateLegacyChatGPTModel(config: MercuryConfig): MercuryConfig {
+  const chatgpt = config.providers?.chatgptWeb;
+  if (chatgpt?.enabled && !((CHATGPT_CODEX_MODEL_SLUGS as readonly string[]).includes(chatgpt.model))) {
+    logger.warn({ staleModel: chatgpt.model, replacement: DEFAULT_CHATGPT_CODEX_MODEL }, 'chatgptWeb model not entitled on the Codex backend — migrating');
+    chatgpt.model = DEFAULT_CHATGPT_CODEX_MODEL;
+  }
+  return config;
 }
 
 export function normalizeCloudConfig(config: MercuryConfig): MercuryConfig {
@@ -623,16 +865,19 @@ export function isProviderConfigured(provider: ProviderConfig): boolean {
   if (provider.name === 'mercuryCloud') {
     return provider.model.length > 0;
   }
-  if (provider.name === 'ollamaLocal') {
+  if (provider.name === 'ollamaLocal' || provider.name === 'atomicChat') {
     return provider.baseUrl.length > 0 && provider.model.length > 0;
   }
   if (provider.name === 'ollamaCloud') {
     return provider.apiKey.length > 0 && provider.baseUrl.length > 0;
   }
-  if (provider.name === 'atlascloud') {
+  if (provider.name === 'atlascloud' || provider.name === 'runcrate' || provider.name === 'cloudgpu') {
     return provider.apiKey.length > 0 && provider.baseUrl.length > 0 && provider.model.length > 0;
   }
-  if (provider.name === 'openaiCompat') {
+  if (provider.name === 'openaiCompat' || provider.name === 'litellm') {
+    return provider.baseUrl.length > 0 && provider.model.length > 0;
+  }
+  if (provider.name === 'lmStudio') {
     return provider.baseUrl.length > 0 && provider.model.length > 0;
   }
   if (provider.name === 'chatgptWeb') {

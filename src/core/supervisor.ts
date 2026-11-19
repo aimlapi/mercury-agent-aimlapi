@@ -1,4 +1,5 @@
 import type { MercuryConfig } from '../utils/config.js';
+import { exposure } from '../security/provenance.js';
 import type { ProviderRegistry } from '../providers/registry.js';
 import type { Identity } from '../soul/identity.js';
 import type { ShortTermMemory, LongTermMemory, EpisodicMemory } from '../memory/store.js';
@@ -12,6 +13,8 @@ import { FileLockManager } from './file-lock.js';
 import { TaskBoard } from './task-board.js';
 import { ResourceManager } from './resource-manager.js';
 import { logger } from '../utils/logger.js';
+import { deriveChildContext, type PermissionContext } from '../capabilities/permission-context.js';
+import type { PermissionManager } from '../capabilities/permissions.js';
 
 /** Bounded auto-resumes after a step-budget pause before reporting honestly. */
 const MAX_SUBAGENT_STEP_RESUMES = 3;
@@ -48,6 +51,12 @@ export class SubAgentSupervisor {
   /** Bounded auto-resume counter for step-budget pauses, per agent. */
   private stepResumeCounts: Map<string, number> = new Map();
   private pauseResolvers: Map<string, () => void> = new Map();
+  /**
+   * Lineage: agent id → id of the sub-agent that delegated it (undefined for
+   * agents spawned by the main agent or a user command). Kept after an agent
+   * finishes so a grandchild's chain still resolves once its parent is gone.
+   */
+  private parents: Map<string, string | undefined> = new Map();
 
   constructor(
     dependencies: {
@@ -116,7 +125,16 @@ export class SubAgentSupervisor {
 
   async spawn(config: Omit<SubAgentConfig, 'id'>): Promise<string> {
     const id = this.taskBoard.nextId();
-    const fullConfig: SubAgentConfig = { ...config, id };
+    // Snapshot the spawning agent's permission context NOW (spawn runs inside
+    // the caller's async context): a queued agent that starts later must not
+    // pick up whatever the main agent's context is at that moment.
+    const fullConfig: SubAgentConfig = {
+      ...config,
+      id,
+      permissionContext: config.permissionContext ?? this.childPermissionContext(config),
+      exposure: config.exposure ?? exposure(),
+    };
+    this.parents.set(id, config.parentId);
 
     if (!this.resourceManager.canSpawn()) {
       logger.info({ task: config.task.slice(0, 50) }, 'No resources available, queuing sub-agent task');
@@ -170,7 +188,42 @@ export class SubAgentSupervisor {
     return id;
   }
 
+  private childPermissionContext(config: Omit<SubAgentConfig, 'id'>): PermissionContext | undefined {
+    const permissions = this.capabilities.permissions as Partial<PermissionManager> | undefined;
+    if (typeof permissions?.currentContext !== 'function') return undefined;
+    return deriveChildContext(permissions.currentContext(), {
+      channelType: config.sourceChannelType,
+      channelId: config.sourceChannelId,
+      allowedTools: config.allowedTools,
+    });
+  }
+
+  /**
+   * Agents the owner halted (ADR-038). A halt is final: no step-budget
+   * auto-resume, no start from the wait queue, however the halt raced them.
+   * Bounded; ids are unique per spawn.
+   */
+  private readonly haltedIds = new Set<string>();
+
+  private markHalted(agentId: string): void {
+    this.haltedIds.add(agentId);
+    this.stepResumeCounts.delete(agentId);
+    if (this.haltedIds.size > 1000) {
+      const oldest = this.haltedIds.values().next().value;
+      if (oldest !== undefined) this.haltedIds.delete(oldest);
+    }
+  }
+
+  /** Was this agent halted by the owner? */
+  wasHalted(agentId: string): boolean {
+    return this.haltedIds.has(agentId);
+  }
+
   private startAgentInBackground(config: SubAgentConfig): void {
+    if (this.haltedIds.has(config.id)) {
+      logger.info({ agentId: config.id }, 'Not starting a halted sub-agent');
+      return;
+    }
     this.agentConfigs.set(config.id, config);
     const subAgent = new SubAgent(config, {
       agentConfig: this.agentConfig,
@@ -185,6 +238,7 @@ export class SubAgentSupervisor {
       fileLockManager: this.fileLockManager,
       taskBoard: this.taskBoard,
       saverMode: this.saverMode,
+      supervisor: this,
     });
 
     this.activeAgents.set(config.id, subAgent);
@@ -264,7 +318,7 @@ export class SubAgentSupervisor {
     if (result.status === 'paused') {
       const config = this.agentConfigs.get(agentId);
       const resumes = this.stepResumeCounts.get(agentId) ?? 0;
-      if (config && resumes < MAX_SUBAGENT_STEP_RESUMES) {
+      if (config && resumes < MAX_SUBAGENT_STEP_RESUMES && !this.haltedIds.has(agentId)) {
         this.stepResumeCounts.set(agentId, resumes + 1);
         const entry = this.taskBoard.get(agentId);
         if (entry) {
@@ -335,14 +389,45 @@ export class SubAgentSupervisor {
     }
   }
 
-  async halt(agentId: string): Promise<boolean> {
+  /** Id of the sub-agent that delegated `agentId`, if any. */
+  getParentId(agentId: string): string | undefined {
+    return this.parents.get(agentId);
+  }
+
+  /**
+   * True when `agentId` sits strictly below `ancestorId` in the delegation
+   * tree. The main agent is not an id, so callers representing it pass no
+   * ancestor and own everything.
+   */
+  isDescendant(agentId: string, ancestorId: string): boolean {
+    let current = this.parents.get(agentId);
+    for (let depth = 0; current !== undefined && depth < 1000; depth++) {
+      if (current === ancestorId) return true;
+      current = this.parents.get(current);
+    }
+    return false;
+  }
+
+  /**
+   * Halt one agent (running or queued). When `callerId` is given, the target
+   * must be one of the caller's descendants — a sub-agent can never halt a
+   * sibling or an ancestor (#74).
+   */
+  async halt(agentId: string, callerId?: string): Promise<boolean> {
+    if (callerId !== undefined && !this.isDescendant(agentId, callerId)) {
+      logger.warn({ agentId, callerId }, 'Cannot halt — agent is not a descendant of the caller');
+      return false;
+    }
+
     const agent = this.activeAgents.get(agentId);
-    if (!agent) {
+    const queued = this.waitQueue.some(c => c.id === agentId);
+    if (!agent && !queued) {
       logger.warn({ agentId }, 'Cannot halt — agent not found');
       return false;
     }
 
-    agent.abort();
+    this.markHalted(agentId);
+    agent?.abort();
 
     this.waitQueue = this.waitQueue.filter(c => c.id !== agentId);
 
@@ -358,19 +443,65 @@ export class SubAgentSupervisor {
     return true;
   }
 
-  async haltAll(): Promise<void> {
+  /**
+   * Halt every agent, or — with `callerId` — only the caller's descendants.
+   * Returns the ids that were signalled.
+   */
+  async haltAll(callerId?: string): Promise<string[]> {
+    const owned = (id: string) => callerId === undefined || this.isDescendant(id, callerId);
+    const halted: string[] = [];
+
     for (const [agentId, agent] of this.activeAgents.entries()) {
+      if (!owned(agentId)) continue;
+      this.markHalted(agentId);
       agent.abort();
+      halted.push(agentId);
     }
 
+    const remaining: SubAgentConfig[] = [];
     for (const config of this.waitQueue) {
+      if (!owned(config.id)) {
+        remaining.push(config);
+        continue;
+      }
+      this.markHalted(config.id);
       this.taskBoard.update(config.id, {
         status: 'halted',
         completedAt: Date.now(),
         progress: 'Halted while queued',
       });
+      halted.push(config.id);
     }
-    this.waitQueue = [];
+    this.waitQueue = remaining;
+    return halted;
+  }
+
+  /**
+   * Halt only the agents started from one chat (ADR-037: a /stop in one chat
+   * leaves the others' delegated work running). Delegated grandchildren carry
+   * the same source chat. Returns the ids that were signalled.
+   */
+  async haltForChannel(channelId: string): Promise<string[]> {
+    const fromChannel = (config: SubAgentConfig) => config.sourceChannelId === channelId;
+    const halted: string[] = [];
+    for (const [agentId, agent] of this.activeAgents.entries()) {
+      if (!fromChannel(agent.config)) continue;
+      this.markHalted(agentId);
+      agent.abort();
+      halted.push(agentId);
+    }
+    const remaining: SubAgentConfig[] = [];
+    for (const config of this.waitQueue) {
+      if (!fromChannel(config)) {
+        remaining.push(config);
+        continue;
+      }
+      this.markHalted(config.id);
+      this.taskBoard.update(config.id, { status: 'halted', completedAt: Date.now(), progress: 'Halted while queued' });
+      halted.push(config.id);
+    }
+    this.waitQueue = remaining;
+    return halted;
   }
 
   async pause(agentId: string): Promise<boolean> {
@@ -403,6 +534,11 @@ export class SubAgentSupervisor {
   clearTaskBoard(): void {
     this.fileLockManager.clearAll();
     this.taskBoard.clear();
+    // Only forget lineage for agents that are gone; a live subtree keeps its
+    // chain so its stop_agent/list_agents stay confined.
+    for (const id of [...this.parents.keys()]) {
+      if (!this.activeAgents.has(id) && !this.waitQueue.some(c => c.id === id)) this.parents.delete(id);
+    }
   }
 
   getResourceUsage(): ResourceUsage {
@@ -413,10 +549,16 @@ export class SubAgentSupervisor {
     );
   }
 
-  getActiveAgents(): Array<{ id: string; task: string; status: SubAgentStatus; progress?: string }> {
+  /**
+   * Active and queued agents. With `ownerId`, only that sub-agent's
+   * descendants are listed — a child never learns about its siblings.
+   */
+  getActiveAgents(ownerId?: string): Array<{ id: string; task: string; status: SubAgentStatus; progress?: string }> {
     const agents: Array<{ id: string; task: string; status: SubAgentStatus; progress?: string }> = [];
+    const owned = (id: string) => ownerId === undefined || this.isDescendant(id, ownerId);
 
     for (const [id, agent] of this.activeAgents.entries()) {
+      if (!owned(id)) continue;
       const entry = this.taskBoard.get(id);
       agents.push({
         id,
@@ -427,6 +569,7 @@ export class SubAgentSupervisor {
     }
 
     for (const config of this.waitQueue) {
+      if (!owned(config.id)) continue;
       agents.push({
         id: config.id,
         task: config.task,

@@ -48,12 +48,28 @@ export type SubAgentPriority = 'low' | 'normal' | 'high';
 export interface SubAgentConfig {
   id: string;
   task: string;
+  /** What untrusted content the delegating turn had read (ADR-044): the sub-agent starts with it. */
+  exposure?: import('../security/provenance.js').Exposure;
   workingDirectory?: string;
   allowedTools?: string[];
   maxSteps?: number;
   priority?: SubAgentPriority;
   sourceChannelId?: string;
   sourceChannelType?: string;
+  /**
+   * Id of the sub-agent that spawned this one via `delegate_task`; absent
+   * when the main agent (or a user command) spawned it. The supervisor uses
+   * it for lineage checks: a sub-agent may only list or stop its own
+   * descendants (#74).
+   */
+  parentId?: string;
+  /**
+   * Frozen permission context, derived from the spawning agent's context at
+   * spawn time (child ⊆ parent; ADR-016). The sub-agent runs under it via
+   * AsyncLocalStorage. Absent only for agents constructed directly (tests),
+   * which derive one from the current context when they start.
+   */
+  permissionContext?: import('../capabilities/permission-context.js').PermissionContext;
 }
 
 export interface SubAgentResult {

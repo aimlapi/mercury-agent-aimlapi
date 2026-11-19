@@ -106,7 +106,7 @@ describe('Mercury Code terminal modes', () => {
     vi.restoreAllMocks();
   });
 
-  it('enables mouse wheel scrolling in Mercury Code and disables it on exit', () => {
+  it('keeps mouse reporting OFF in Mercury Code (native scrollback: wheel scrolls, drag selects)', () => {
     const writes: string[] = [];
     vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array) => {
       writes.push(String(chunk));
@@ -116,19 +116,17 @@ describe('Mercury Code terminal modes', () => {
     const channel = new CLIChannel();
     const result = channel.enterMercuryCode(process.cwd(), 'test');
 
-    // Wheel scroll is the only natural way back through a full-screen
-    // transcript — mouse reporting must be ON while Mercury Code is active.
+    // The transcript prints into the terminal's native scrollback, so the
+    // terminal itself handles wheel scrolling and drag selection. Mouse
+    // reporting must stay OFF — it would capture wheel/drag events and
+    // break both.
     expect(result.ok).toBe(true);
-    expect(channel.isMouseEnabled()).toBe(true);
-    expect(channel.getTuiState().mercuryCode?.mouse).toBe(true);
-    expect(writes.join('')).toContain('\x1b[?1006h');
-
-    channel.exitMercuryCode();
     expect(channel.isMouseEnabled()).toBe(false);
-    expect(writes.join('')).toContain('\x1b[?1006l');
+    expect(channel.getTuiState().mercuryCode?.mouse).toBe(false);
+    expect(writes.join('')).not.toContain('\x1b[?1006h');
   });
 
-  it('adds per-file git statistics to execute-mode completion', () => {
+  it('adds per-file git statistics to execute-mode completion — attributed to the turn’s own file tools', () => {
     vi.spyOn(process.stdout, 'write').mockImplementation((() => true) as typeof process.stdout.write);
     const cwd = mkdtempSync(join(tmpdir(), 'mercury-code-'));
     try {
@@ -141,14 +139,25 @@ describe('Mercury Code terminal modes', () => {
 
       const channel = new CLIChannel();
       channel.enterMercuryCode(cwd, 'test');
-      channel.setProgrammingStatus('execute', cwd);
+      // The turn's file-tool calls mutate the tree; a failed one does not.
+      void channel.sendToolEvent('create_file', { path: 'new.txt' }, 'call-1');
+      channel.completeToolEvent('create_file', { result: 'Created new.txt' }, false);
+      void channel.sendToolEvent('edit_file', { path: 'tracked.txt' }, 'call-2');
+      channel.completeToolEvent('edit_file', { result: 'Edited tracked.txt' }, false);
+      void channel.sendToolEvent('edit_file', { path: 'ghost.txt' }, 'call-2');
+      channel.completeToolEvent('edit_file', { result: '⚠ permission denied' }, true);
+
       channel.sendCompletion(1200, 2);
 
       const completion = channel.getTuiState().chatMessages.at(-1);
-      expect(completion?.fileChanges).toEqual([
-        { path: 'new.txt', added: 2, removed: 0 },
-        { path: 'tracked.txt', added: 1, removed: 0 },
-      ]);
+      // Files at the top, scoped to what the turn's tools actually mutated:
+      // new.txt (created) and tracked.txt (edited); the FAILED ghost.txt edit
+      // and any pre-existing uncommitted repo changes are NOT attributed.
+      expect(completion?.content).toContain('**Changes** · 2 files');
+      expect(completion?.content).toContain('  ↳ new.txt · +2 −0');
+      expect(completion?.content).toContain('  ↳ tracked.txt · +1 −0');
+      expect(completion?.content).not.toContain('ghost.txt');
+      expect(completion?.fileChanges).toBeUndefined(); // no duplicate rows
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

@@ -3,9 +3,18 @@ import { describe, expect, it } from 'vitest';
 // Secret-shaped fixtures are assembled at runtime: contiguous literals in
 // this file would trip GitHub push protection's secret scanner.
 const join = (...parts: string[]) => parts.join('');
-import { redactSecrets, redactDeep } from './redact.js';
+import { redactSecrets, redactDeep, registerSecretValue, userFacingAiError } from './redact.js';
 
 describe('secret redaction', () => {
+  it('masks registered secret values wherever they appear', () => {
+    const secret = join('plain-registered-', 'value-0042');
+    expect(redactSecrets(`token is ${secret}.`)).toBe(`token is ${secret}.`);
+    registerSecretValue(secret);
+    expect(redactSecrets(`token is ${secret}, again ${secret}`)).toBe('token is ****, again ****');
+    registerSecretValue('short');
+    expect(redactSecrets('a short word')).toBe('a short word');
+  });
+
   it('masks API keys while keeping a recognizable prefix/suffix', () => {
     const out = redactSecrets(join('export OPENAI_API_KEY=sk-proj-', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', '1234567890abcd'));
     expect(out).not.toContain('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
@@ -24,6 +33,13 @@ describe('secret redaction', () => {
     expect(out).toContain(join('Bear****', '.sig'));
   });
 
+  it('masks a short password in yaml and a Basic header in full', () => {
+    expect(redactSecrets('username: alice\n    password: s3cret\n')).toBe('username: alice\n    password: ****\n');
+    expect(redactSecrets('password = "hunter22hunter22"')).toBe('password = "****"');
+    const token = Buffer.from('alice:s3cret').toString('base64');
+    expect(redactSecrets(`Authorization: Basic ${token}`)).toBe('Authorization: Basic ****');
+  });
+
   it('leaves ordinary code and config untouched', () => {
     const code = 'const apiKeyField = "name";\nskylight.trim();\nconst tokenCount = 123456789012;';
     expect(redactSecrets(code)).toBe(code);
@@ -38,5 +54,77 @@ describe('secret redaction', () => {
     expect(out.message).not.toContain('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
     expect((out.meta as any).responseBody).not.toContain(join('sk-', 'abcdefghijklmnopqrstuvwx'));
     expect(err.message).toContain(join('sk-ant-', 'ABC')); // original untouched
+  });
+});
+
+describe('Google secret redaction', () => {
+  const access = join('ya29.', 'a0AfH6SMBxK3example', 'TokenValue_0123456789');
+  const refresh = join('1//', '0gExampleRefresh', 'TokenValue-abcdefghij');
+  const clientSecret = join('GOCSPX-', 'AbCdEfGhIjKlMnOp', 'QrStUvWxYz12');
+  const pem = [join('-----BEGIN ', 'PRIVATE KEY-----'), join('MIIEvQIBADANBgkq', 'hkiG9w0BAQEFAASC'), join('-----END ', 'PRIVATE KEY-----'), ''].join('\n');
+
+  it('masks bare access tokens, refresh tokens and OAuth client secrets', () => {
+    const out = redactSecrets(`access ${access}\nrefresh ${refresh}\nsecret ${clientSecret}`);
+    expect(out).not.toContain('a0AfH6SMBxK3example');
+    expect(out).not.toContain('0gExampleRefresh');
+    expect(out).not.toContain('AbCdEfGhIjKlMnOp');
+    expect(out).toContain('ya29****6789');
+    expect(out).toContain('1//0****ghij');
+    expect(out).toContain('GOCS****Yz12');
+  });
+
+  it('masks gws auth export output and keeps the key names', () => {
+    const exported = JSON.stringify({
+      client_id: '123-abc.apps.googleusercontent.com',
+      client_secret: clientSecret,
+      refresh_token: refresh,
+      type: 'authorized_user',
+    }, null, 2);
+    const out = redactSecrets(exported);
+    expect(out).toContain('"client_id": "123-abc.apps.googleusercontent.com"');
+    expect(out).toContain('"client_secret": "GOCS****Yz12"');
+    expect(out).toContain('"refresh_token": "1//0****ghij"');
+    expect(out).toContain('"type": "authorized_user"');
+  });
+
+  it('masks JSON secrets whatever their format', () => {
+    const out = redactSecrets(JSON.stringify({
+      client_secret: join('legacySecret', 'Value1234'),
+      token: join('opaque-token-', 'value-5678'),
+      password: join('hunter2', 'hunter2'),
+      api_key: join('abcdefgh', '12345678'),
+    }));
+    expect(out).toBe('{"client_secret":"lega****1234","token":"opaq****5678","password":"****","api_key":"abcd****5678"}');
+  });
+
+  it('masks a service-account private key, in JSON and as a file', () => {
+    const account = JSON.stringify({ type: 'service_account', private_key: pem, client_email: 'bot@p.iam.gserviceaccount.com' });
+    const out = redactSecrets(account);
+    expect(out).not.toContain('MIIEvQIBADANBgkq');
+    expect(out).toContain('"client_email":"bot@p.iam.gserviceaccount.com"');
+    expect(redactSecrets(pem)).not.toContain('MIIEvQIBADANBgkq');
+  });
+
+  it('leaves URLs and ordinary JSON alone', () => {
+    const text = 'see https://example.com//path?v=1 and file:///tmp/a';
+    expect(redactSecrets(text)).toBe(text);
+    const json = '{"name": "Ana", "nextPageToken": "CAESBggDEAEYAQ", "q": "is:unread", "password": "short"}';
+    expect(redactSecrets(json)).toBe(json);
+  });
+});
+
+describe('user-facing AI errors', () => {
+  it('names a spent token budget instead of falling back to the generic line', () => {
+    // The exact shape the daemon builds when isOverBudget() refuses a turn.
+    const refusal = new Error(
+      "I've exceeded my daily token budget (Token budget: 9,907,679 / 500,000,000 used (2%), 490,092,321 remaining).",
+    );
+    const message = userFacingAiError(refusal);
+    expect(message).toMatch(/daily token budget/);
+    expect(message).not.toMatch(/could not complete this request/);
+  });
+
+  it('keeps a provider quota error as a provider problem', () => {
+    expect(userFacingAiError(new Error('429 quota exceeded for this project'))).toMatch(/temporarily busy/);
   });
 });

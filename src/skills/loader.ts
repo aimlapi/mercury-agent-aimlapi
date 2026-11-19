@@ -1,14 +1,50 @@
-import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync, rmSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync, rmSync, unlinkSync, renameSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
 import { parse as parseYaml } from 'yaml';
 import { getMercuryHome } from '../utils/config.js';
 import type { SkillDiscovery, Skill, SkillMeta } from './types.js';
+import { recordSelfMadeUse, SELF_MADE_CATEGORY, SELF_MADE_LABEL } from './self-made.js';
 import { IntentRouter } from './intent-router.js';
 import { logger } from '../utils/logger.js';
-import { DEFAULT_SKILL_SEEDS, getCategoryLabel } from './default-skills.js';
+import { DEFAULT_SKILL_SEEDS, PREVIOUS_SEED_CONTENTS, RETIRED_SEEDS, getCategoryLabel } from './default-skills.js';
+
+/**
+ * The web-search skill dir holds a skill that tells the model to fetch a
+ * search engine's HTML results page and never mentions the web_search tool.
+ * Those pages answer automated requests with a bot challenge, so such a
+ * skill only ever returns nothing.
+ */
+export function isBrokenSearchSkill(dirName: string, content: string): boolean {
+  if (dirName !== 'web-search') return false;
+  if (/\bweb_search\b/.test(content)) return false;
+  return /(html|lite)\.duckduckgo\.com|duckduckgo\.com\/html|google\.[a-z.]+\/search\?|bing\.com\/search\?q=/i.test(content);
+}
 
 const SKILL_FILE = 'SKILL.md';
+/** Which built-in skills were installed once (see ensureDefaultSkills). */
+const SEEDED_FILE = '.seeded-defaults.json';
 const DISABLED_FILE = '.disabled';
+
+/**
+ * Skill folders other agents share: `~/.agents/skills` (the cross-agent
+ * standard that `npx skills add` installs into) and `~/.claude/skills`.
+ * Skills there (HyperFrames, for one) are usable by name in Mercury too,
+ * read-only. Mercury's own skills win on a name clash. Off with
+ * MERCURY_SHARED_SKILLS=0.
+ */
+export function sharedSkillDirs(home = homedir()): string[] {
+  if (process.env.MERCURY_SHARED_SKILLS === '0') return [];
+  return [join(home, '.agents', 'skills'), join(home, '.claude', 'skills')];
+}
+
+/** A shared skill's description for the always-sent list: its first sentence, short. */
+function briefDescription(d: string, max = 160): string {
+  const t = d.replace(/\s+/g, ' ').trim();
+  const first = /^(.{20,}?[.!?])(\s|$)/.exec(t)?.[1] ?? t;
+  return first.length <= max ? first : `${first.slice(0, max - 1).replace(/\s+\S*$/, '')}…`;
+}
 
 function parseSkillMd(content: string): { meta: SkillMeta; instructions: string } | null {
   const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
@@ -30,12 +66,22 @@ function parseSkillMd(content: string): { meta: SkillMeta; instructions: string 
 
 export class SkillLoader {
   private skillsDir: string;
+  /** Additional read-only skill roots (e.g. a bot's own skills dir). Own-dir entries load after the primary dir, so they win on name collision. */
+  private extraDirs: string[];
+  /** Folders other agents share (sharedSkillDirs): read before the primary dir, so Mercury's own skills win. */
+  private sharedDirs: string[];
+  private sharedPaths = new Set<string>();
+  private seedDefaults: boolean;
   private discovered: Map<string, SkillDiscovery> = new Map();
   private loaded: Map<string, Skill> = new Map();
   readonly intentRouter: IntentRouter;
 
-  constructor(skillsDir?: string) {
+  constructor(skillsDir?: string, options?: { extraDirs?: string[]; seedDefaults?: boolean; sharedDirs?: string[] }) {
     this.skillsDir = skillsDir || join(getMercuryHome(), 'skills');
+    this.extraDirs = options?.extraDirs ?? [];
+    // Only the owner's own loader reads shared folders (not bots, not a custom root).
+    this.sharedDirs = options?.sharedDirs ?? (skillsDir ? [] : sharedSkillDirs());
+    this.seedDefaults = options?.seedDefaults !== false;
     this.intentRouter = new IntentRouter();
   }
 
@@ -43,17 +89,22 @@ export class SkillLoader {
     this.discovered.clear();
     this.loaded.clear();
     if (!existsSync(this.skillsDir)) {
+      if (!this.seedDefaults) return [];
       mkdirSync(this.skillsDir, { recursive: true });
       this.seedTemplate();
     }
 
-    this.ensureDefaultSkills();
+    if (this.seedDefaults) {
+      this.retireOldDefaults();
+      this.ensureDefaultSkills();
+    }
 
     // Walk both layouts:
     //   - flat:   <skillsDir>/<name>/SKILL.md            (legacy + user-authored)
     //   - nested: <skillsDir>/<category>/<slug>/SKILL.md (mercury skills install)
     // User-installed nested skills win over flat ones on name collision (registered last).
     const skillPaths = this.findSkillFiles();
+    const parsedSkills: Array<{ meta: SkillMeta; path: string }> = [];
     for (const skillPath of skillPaths) {
       try {
         const raw = readFileSync(skillPath, 'utf-8');
@@ -62,16 +113,22 @@ export class SkillLoader {
         this.discovered.set(parsed.meta.name, {
           name: parsed.meta.name,
           description: parsed.meta.description,
+          ...(this.sharedPaths.has(skillPath) ? { shared: true } : {}),
         });
-        this.intentRouter.registerSkillMeta(parsed.meta);
-        logger.info({ skill: parsed.meta.name, path: skillPath, category: parsed.meta.category, intents: parsed.meta.intents?.length }, 'Skill discovered');
+        parsedSkills.push({ meta: parsed.meta, path: skillPath });
       } catch (err) {
         logger.warn({ path: skillPath, err }, 'Failed to load skill');
       }
     }
 
-    // Build intent index from discovered skills (basic info for fallback matching)
+    // Reset the router with the bare list first, then enrich every entry with
+    // its category, intents and tags. (The other order wiped the metadata on
+    // every scan, so grouping and intent routing silently fell back to names.)
     this.intentRouter.buildIndex([...this.discovered.values()]);
+    for (const { meta, path } of parsedSkills) {
+      this.intentRouter.registerSkillMeta(meta);
+      logger.info({ skill: meta.name, path, category: meta.category, intents: meta.intents?.length }, 'Skill discovered');
+    }
 
     return [...this.discovered.values()];
   }
@@ -92,6 +149,8 @@ export class SkillLoader {
         const skill: Skill = {
           ...parsed.meta,
           instructions: parsed.instructions,
+          dir: skillDir,
+          ...(this.sharedPaths.has(skillPath) ? { shared: true } : {}),
           scriptsDir: existsSync(join(skillDir, 'scripts')) ? join(skillDir, 'scripts') : undefined,
           referencesDir: existsSync(join(skillDir, 'references')) ? join(skillDir, 'references') : undefined,
         };
@@ -116,11 +175,42 @@ export class SkillLoader {
    */
   private findSkillFiles(): string[] {
     const out: string[] = [];
-    if (!existsSync(this.skillsDir)) return out;
+    // Shared first: later entries win on a name clash, so Mercury's own skills override.
+    for (const dir of this.sharedDirs) {
+      const before = out.length;
+      this.findSkillFilesIn(dir, out);
+      for (const p of out.slice(before)) this.sharedPaths.add(p);
+    }
+    // The same skill in two shared folders (~/.agents and ~/.claude): keep one.
+    const seen = new Set<string>();
+    for (let i = out.length - 1; i >= 0; i--) {
+      const name = out[i].split(sep).slice(-2, -1)[0];
+      if (seen.has(name)) out.splice(i, 1); else seen.add(name);
+    }
+    for (const dir of [this.skillsDir, ...this.extraDirs]) {
+      this.findSkillFilesIn(dir, out);
+    }
+    return out;
+  }
 
-    for (const entry of readdirSync(this.skillsDir, { withFileTypes: true })) {
+  /** The discovered skill closest to a name the user or model wrote ("hyperframe", "Hyper Frames"). */
+  closest(name: string): string | null {
+    const sq = (s: string) => s.toLowerCase().replace(/[\s._-]+/g, '').replace(/s$/, '');
+    const n = sq(name);
+    if (n.length < 3) return null;
+    const names = [...this.discovered.keys()];
+    return names.find((k) => sq(k) === n)
+      ?? names.filter((k) => sq(k).startsWith(n) || n.startsWith(sq(k))).sort((a, b) => a.length - b.length)[0]
+      ?? null;
+  }
+
+  /** Walk one skills root (flat + one nested category level), appending SKILL.md paths. */
+  private findSkillFilesIn(skillsDir: string, out: string[]): string[] {
+    if (!existsSync(skillsDir)) return out;
+
+    for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name.startsWith('_') || entry.name.startsWith('.')) continue;
-      const dir = join(this.skillsDir, entry.name);
+      const dir = join(skillsDir, entry.name);
       if (existsSync(join(dir, DISABLED_FILE))) continue;
 
       const flat = join(dir, SKILL_FILE);
@@ -148,9 +238,21 @@ export class SkillLoader {
     return [...this.discovered.values()];
   }
 
+  /** The primary skills root (where self-made skills are written). */
+  rootDir(): string {
+    return this.skillsDir;
+  }
+
+  /** Count a use of a self-made skill (no-op for curated ones). */
+  noteUse(name: string): void {
+    recordSelfMadeUse(this.skillsDir, name);
+  }
+
   getSkillSummariesText(): string {
     const skills = this.getDiscovered();
     if (skills.length === 0) return '';
+    const sharedNames = new Set(skills.filter((s) => s.shared).map((s) => s.name));
+    const own = skills.filter((s) => !s.shared);
 
     // Group skills by category using IntentRouter
     const categories = this.intentRouter.getAllCategories();
@@ -159,11 +261,16 @@ export class SkillLoader {
     let text = '**Available Skills** (invoke with the `use_skill` tool):\n';
 
     if (hasCategories && categories.size > 1) {
-      // Group by category
+      // Group by category. A skill in several categories is listed once,
+      // under the first (every line here is re-sent with each request).
+      const listed = new Set<string>();
       for (const [category, catSkills] of categories) {
-        const label = getCategoryLabel(category);
+        const fresh = catSkills.filter((s) => !listed.has(s.name) && !sharedNames.has(s.name));
+        if (fresh.length === 0) continue;
+        const label = category === SELF_MADE_CATEGORY ? SELF_MADE_LABEL : getCategoryLabel(category);
         text += `\n**${label}:**\n`;
-        for (const s of catSkills) {
+        for (const s of fresh) {
+          listed.add(s.name);
           const discovered = this.discovered.get(s.name);
           const desc = discovered?.description || s.description;
           text += `- ${s.name}: ${desc}\n`;
@@ -171,43 +278,51 @@ export class SkillLoader {
       }
     } else {
       // Flat list (no categorization or only one category)
-      text += skills.map(s => `- ${s.name}: ${s.description}`).join('\n');
+      text += own.map(s => `- ${s.name}: ${s.description}`).join('\n');
     }
 
-    // Auto-routing hint for web search
+    // Skills other agents share, compactly: a family (hyperframes, hyperframes-core, …) is one line.
+    const shared = skills.filter((s) => s.shared).sort((a, b) => a.name.localeCompare(b.name));
+    if (shared.length) {
+      text += '\n\n**Shared skills** (installed for other agents too; load the same way):\n';
+      const children = new Map<string, string[]>();
+      const heads = shared.filter((s) => !shared.some((p) => p !== s && s.name.startsWith(`${p.name}-`)));
+      for (const s of shared) {
+        const head = heads.find((h) => h !== s && s.name.startsWith(`${h.name}-`));
+        if (head) children.set(head.name, [...(children.get(head.name) ?? []), s.name]);
+      }
+      for (const h of heads) {
+        const kids = children.get(h.name);
+        text += `- ${h.name}: ${briefDescription(h.description)}${kids?.length ? ` (with ${kids.join(', ')})` : ''}\n`;
+      }
+    }
+
+    // Skills are optional procedures, never a gate in front of the answer
+    // (ADR-039). These lines used to say "you MUST invoke the web-search
+    // skill immediately" and "MUST invoke tweet-notifier", which pulled every
+    // model toward a skill even for local questions ("which Docker
+    // containers are running?").
     const hasWebSearchSkill = skills.some(s => s.name === 'web-search');
     if (hasWebSearchSkill) {
-      text += '\n\n**Important — Web Search:** When the user asks about current events, news, real-time information, '
-        + 'or anything that requires up-to-date knowledge beyond your training data, you MUST invoke the `web-search` skill '
-        + 'via `use_skill` immediately — do NOT attempt to answer from memory or ask clarifying questions first. '
-        + 'Fetch real information, then respond.';
+      text += '\n\n**Current information:** for news, prices or anything newer than your training data, look it up '
+        + '(the web_search tool, or the `web-search` skill when you want its full procedure) instead of answering from memory. '
+        + 'Questions about this computer, its files or programs are not web questions.';
     }
 
-    // Auto-routing hint for tweet-notifier
-    const hasTweetNotifier = skills.some(s => s.name === 'tweet-notifier');
-    if (hasTweetNotifier) {
-      text += '\n\n**Tweet Notification System:** When the user says things like '
-        + '"schedule a tweet", "approve this tweet", "notify supporters about the tweet", '
-        + '"post this tweet at 3pm", "show pending tweets", "reject tweet", or mentions '
-        + 'tweet scheduling/approval/posting workflows, you MUST invoke the `tweet-notifier` skill '
-        + 'via `use_skill` before proceeding. The skill contains complete notification templates, '
-        + 'workflow steps, and the memory schema for tracking tweet states (draft, scheduled, '
-        + 'pending_approval, approved, posted, cancelled).';
-    }
-
-    // Intent routing hint — tell the agent about the new system
-    text += '\n\n**Skill Intent Routing** — When a user request clearly matches a skill, '
-      + 'invoke it via `use_skill` immediately. If the request is ambiguous (could match '
-      + 'multiple skills equally well), prefer asking the user with the `ask_user` tool '
-      + 'over guessing or fanning out across many skills. '
-      + 'Users can also explicitly pick a skill by prefixing their message with '
-      + '`#skill-name` — when you see that prefix the choice is already made for you.';
+    text += '\n\n**Using skills** — When a request clearly matches a skill, invoke it via `use_skill`. '
+      + 'A skill is optional help, not a requirement: if none fits, just do the task. '
+      + 'If the request could match several skills equally, pick the best fit or ask with `ask_user`. '
+      + 'A message that starts with `#skill-name` means the user already picked that skill.'
+      + '\n\n**When the user names a skill, tool or service** ("use hyperframes", "with ElevenLabs", "render it with Remotion"), that is the method: '
+      + 'load the skill whose name matches, even written loosely ("hyperframe", "hyper frames"), follow it to the finished file (render it, don\'t stop at the source), '
+      + 'and pass the named service to the media tools. Never swap in a different method (an AI video model for a HyperFrames render, Google for ElevenLabs) on your own: '
+      + 'if the named one isn\'t available or fails, say so and ask. It holds for the rest of the chat, not only the message that named it.';
 
     return text;
   }
 
   saveSkill(name: string, content: string): string {
-    const skillDir = join(this.skillsDir, name);
+    const skillDir = this.resolveSkillDir(name);
     if (!existsSync(skillDir)) {
       mkdirSync(skillDir, { recursive: true });
     }
@@ -219,6 +334,22 @@ export class SkillLoader {
     logger.info({ skill: name }, 'Skill saved');
     this.discover();
     return skillDir;
+  }
+
+  /**
+   * Resolve a skill name to its directory inside the skills root. Rejects
+   * empty names and names that escape the root (absolute paths, `..`
+   * traversal), so a remote SKILL.md frontmatter `name` cannot cause writes
+   * outside `skillsDir`.
+   */
+  private resolveSkillDir(name: string): string {
+    const trimmed = (name ?? '').trim();
+    const root = resolve(this.skillsDir);
+    const candidate = resolve(root, trimmed);
+    if (!trimmed || candidate === root || !candidate.startsWith(root + sep)) {
+      throw new Error(`Invalid skill name ${JSON.stringify(name)}: resolves outside the skills root`);
+    }
+    return candidate;
   }
 
   getAllSkills(): Array<SkillDiscovery & { active: boolean }> {
@@ -235,6 +366,7 @@ export class SkillLoader {
         list.push({
           name: parsed.meta.name,
           description: parsed.meta.description,
+          ...(parsed.meta.category ? { category: parsed.meta.category } : {}),
           active: !disabled,
         });
       } catch (err) {
@@ -364,22 +496,94 @@ Describe what this skill enables Mercury to do. When invoked via the use_skill t
 - Keep instructions concise to save tokens
 - List only the tools you need in allowed-tools
 - The skill name must be unique among installed skills
-- Add \`category\`, \`categories\`, \`intents\`, and \`tags\` in frontmatter for automatic intent routing
+- Add \`category\` and \`tags\` in frontmatter to group the skill in lists; the description is what Mercury reads to decide when to use it
 `;
 
     writeFileSync(join(templateDir, SKILL_FILE), content, 'utf-8');
     logger.info('Seeded template skill');
   }
 
+  /**
+   * Built-in skills Mercury no longer ships (ADR-040). A copy that is byte
+   * for byte one Mercury seeded was never touched by the owner: it moves to
+   * `_retired-<name>` (underscore folders are not loaded, nothing is
+   * deleted). An edited copy is the owner's own skill and stays where it is.
+   */
+  private retireOldDefaults(): void {
+    for (const [dirName, hashes] of Object.entries(RETIRED_SEEDS)) {
+      const skillDir = join(this.skillsDir, dirName);
+      const skillFile = join(skillDir, SKILL_FILE);
+      if (!existsSync(skillFile)) continue;
+      try {
+        const hash = createHash('sha256').update(readFileSync(skillFile)).digest('hex');
+        if (!hashes.includes(hash)) continue;
+        let target = join(this.skillsDir, `_retired-${dirName}`);
+        if (existsSync(target)) target = `${target}-${Date.now()}`;
+        renameSync(skillDir, target);
+        logger.info({ skill: dirName, movedTo: target }, 'Retired a built-in skill Mercury no longer ships');
+      } catch (err) {
+        logger.warn({ err, skill: dirName }, 'Could not retire an old built-in skill');
+      }
+    }
+  }
+
+  /**
+   * Defaults are installed once (ADR-040). Which ones were installed is kept
+   * in `.seeded-defaults.json`, so a default the owner deletes stays deleted
+   * instead of coming back on the next start; a new default Mercury adds
+   * later is still installed once.
+   */
+  private readSeededDefaults(): Set<string> {
+    try {
+      const parsed = JSON.parse(readFileSync(join(this.skillsDir, SEEDED_FILE), 'utf-8')) as { seeded?: unknown };
+      return new Set(Array.isArray(parsed.seeded) ? parsed.seeded.filter((n): n is string => typeof n === 'string') : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  private writeSeededDefaults(seeded: Set<string>): void {
+    try {
+      writeFileSync(join(this.skillsDir, SEEDED_FILE), JSON.stringify({ seeded: [...seeded].sort() }, null, 2) + '\n', 'utf-8');
+    } catch (err) {
+      logger.warn({ err }, 'Could not record installed default skills');
+    }
+  }
+
   private ensureDefaultSkills(): void {
+    const seeded = this.readSeededDefaults();
+    const before = seeded.size;
     for (const seed of DEFAULT_SKILL_SEEDS) {
       const skillDir = join(this.skillsDir, seed.dirName);
       const skillFile = join(skillDir, seed.fileName);
-      if (existsSync(skillFile)) continue;
+      if (existsSync(skillFile)) {
+        seeded.add(seed.dirName);
+        // Upgrade an untouched copy of an older built-in version; never overwrite edits.
+        try {
+          const current = readFileSync(skillFile, 'utf-8');
+          if (current !== seed.content && (PREVIOUS_SEED_CONTENTS[seed.dirName] ?? []).includes(current)) {
+            writeFileSync(skillFile, seed.content, 'utf-8');
+            logger.info({ skill: seed.dirName }, 'Upgraded default skill');
+          } else if (current !== seed.content && isBrokenSearchSkill(seed.dirName, current)) {
+            // A web-search skill that scrapes a search engine's HTML page
+            // (usually DuckDuckGo, which now answers bots with a challenge)
+            // never works. Keep the owner's copy beside it and use the
+            // built-in one, which calls the web_search tool.
+            writeFileSync(`${skillFile}.replaced.bak`, current, 'utf-8');
+            writeFileSync(skillFile, seed.content, 'utf-8');
+            logger.info({ skill: seed.dirName, backup: `${skillFile}.replaced.bak` }, 'Replaced a web-search skill that scrapes a blocked search page');
+          }
+        } catch { /* leave it */ }
+        continue;
+      }
 
+      // Installed before and gone now: the owner removed it. Leave it removed.
+      if (seeded.has(seed.dirName)) continue;
       mkdirSync(skillDir, { recursive: true });
       writeFileSync(skillFile, seed.content, 'utf-8');
+      seeded.add(seed.dirName);
       logger.info({ skill: seed.dirName }, 'Seeded default skill');
     }
+    if (seeded.size !== before) this.writeSeededDefaults(seeded);
   }
 }

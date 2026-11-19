@@ -1,31 +1,65 @@
 import { Hono } from 'hono';
+import mediaRoutes from './api/media.js';
+import { isBunVirtualPath } from '../utils/bun-path.js';
 import { createAdaptorServer } from '@hono/node-server';
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logger } from '../utils/logger.js';
 import { authGuard, errorHandler } from './middleware.js';
+import { apiCors } from './cors.js';
 import { initWebAuth, getWebPort } from './auth.js';
+import { loadConfig } from '../utils/config.js';
 import authRoutes from './api/auth.js';
 import statusRoutes, { updateStatus } from './api/status.js';
 import providerRoutes from './api/providers.js';
+import cloudRoutes from './api/cloud.js';
+import transcribeRoutes from './api/transcribe.js';
+import speakRoutes from './api/speak.js';
+import budgetRoutes, { setBudgetControls } from './api/budget.js';
+import channelRoutes from './api/channels.js';
+import artifactRoutes from './api/artifacts.js';
 import configRoutes from './api/config.js';
 import systemRoutes, { setScheduler } from './api/system.js';
 import brainRoutes, { setUserMemory } from './api/brain.js';
-import chatRoutes, { setWebChannel, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback, setSessionRepository, setSessionSyncEnabledCallback } from './api/chat.js';
+import chatRoutes, { setWebChannel, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback, setStatusSnapshotCallback, setSessionRepository, setSessionSyncEnabledCallback, setStopCallback, setSessionBusyLookup, setQueueControls, setResearchControls, setTurnControls } from './api/chat.js';
+import suggestionRoutes from './api/suggestions.js';
 import agentRoutes, { setAgentSupervisor, setBackgroundTaskManager } from './api/agents.js';
+import botsRoutes, { setBotManager, setBotsWebhookSecret } from './api/bots.js';
 import spotifyRoutes, { setSpotifyClient } from './api/spotify.js';
 import kanbanRoutes, { setKanbanSupervisor, setKanbanBoardManager, setKanbanProviders } from './api/kanban.js';
 import ideRoutes, { setIDEProviders } from './api/workspace-ide.js';
+import lifecycleRoutes, { setShutdownHandler } from './api/lifecycle.js';
+import mcpRoutes, { setMcpManager } from './api/mcp.js';
+import pluginRoutes from './api/plugins.js';
+import voiceRoutes from './api/voice.js';
+import mobileVoiceRoutes from './api/mobile-voice.js';
+import voiceProviderRoutes from './api/voice-providers.js';
+import deviceRoutes from './api/devices.js';
+import reachRoutes from './api/reach.js';
+import securityRoutes from './api/security.js';
+import updatesRoutes from './api/updates.js';
+import { bodyLimit } from 'hono/body-limit';
+import { migrateDevices } from './devices.js';
 import { BoardManager } from '../core/board-manager.js';
 import { isBetterSqlite3Available } from '../memory/second-brain-db.js';
 
 export { setSessionRepository };
+export { setBudgetControls };
 export { setSessionSyncEnabledCallback };
 
 const app = new Hono();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function readCorsOrigins(): string[] {
+  try {
+    const list = loadConfig().web?.corsOrigins;
+    return Array.isArray(list) ? list.filter((o): o is string => typeof o === 'string') : [];
+  } catch {
+    return [];
+  }
+}
 
 function resolveWebDir(subpath: string): string {
   const envVar = subpath === 'static' ? process.env.MERCURY_WEB_STATIC : process.env.MERCURY_UI_DIR;
@@ -34,7 +68,8 @@ function resolveWebDir(subpath: string): string {
   // When running as a Bun --compile standalone binary, __dirname points to
   // Bun's virtual filesystem ($bunfs).  The web assets are shipped alongside
   // the binary in a `web/` directory, so resolve relative to the binary itself.
-  if (typeof (process.versions as any).bun === 'string' && __dirname.includes('$bunfs')) {
+  // On Windows the virtual root is `B:\~BUN\root` rather than `$bunfs`.
+  if (isBunVirtualPath(__dirname)) {
     return join(dirname(process.execPath), 'web', subpath);
   }
 
@@ -63,20 +98,56 @@ const spaIndexPath = join(uiDir, 'index.html');
 const spaAvailable = existsSync(spaIndexPath);
 
 app.use('*', errorHandler);
+// Baseline headers on everything; pages also refuse to be framed (clickjacking).
+app.use('*', async (c, next) => {
+  await next();
+  c.res.headers.set('X-Content-Type-Options', 'nosniff');
+  c.res.headers.set('Referrer-Policy', 'no-referrer');
+  if ((c.res.headers.get('Content-Type') ?? '').startsWith('text/html')) {
+    c.res.headers.set('X-Frame-Options', 'DENY');
+    if (!c.res.headers.has('Content-Security-Policy')) c.res.headers.set('Content-Security-Policy', "frame-ancestors 'none'");
+  }
+});
+// Sign-in bodies are tiny: refuse big ones before reading them (they arrive without a credential).
+app.use('/api/auth/*', bodyLimit({ maxSize: 64 * 1024, onError: (c) => c.json({ error: 'Request too large' }, 413) }));
+app.use('/login', bodyLimit({ maxSize: 64 * 1024, onError: (c) => c.text('Request too large', 413) }));
+// CORS before the guard: a preflight (OPTIONS) carries no credential and
+// must be answered, not rejected. API routes only; the dashboard itself is
+// same-origin.
+app.use('/api/*', apiCors(readCorsOrigins()));
 app.use('*', authGuard);
 
 // ── API routes (always available) ──
 app.route('/', authRoutes);
 app.route('/', statusRoutes);
 app.route('/', providerRoutes);
+app.route('/', cloudRoutes);
+app.route('/', transcribeRoutes);
+app.route('/', speakRoutes);
+app.route('/', mediaRoutes);
+app.route('/', budgetRoutes);
+app.route('/', channelRoutes);
+app.route('/', artifactRoutes);
+app.route('/', suggestionRoutes);
 app.route('/', configRoutes);
 app.route('/', systemRoutes);
 app.route('/', brainRoutes);
 app.route('/', chatRoutes);
 app.route('/', agentRoutes);
+app.route('/', botsRoutes);
 app.route('/', spotifyRoutes);
 app.route('/', kanbanRoutes);
 app.route('/', ideRoutes);
+app.route('/', lifecycleRoutes);
+app.route('/', mcpRoutes);
+app.route('/', pluginRoutes);
+app.route('/', voiceRoutes);
+app.route('/', mobileVoiceRoutes);
+app.route('/', voiceProviderRoutes);
+app.route('/', reachRoutes);
+app.route('/', deviceRoutes);
+app.route('/', securityRoutes);
+app.route('/', updatesRoutes);
 
 // ── Legacy static assets (vendor fonts, icons, wasm — still needed by React SPA) ──
 app.get('/vendor/*', (c) => {
@@ -191,7 +262,9 @@ if (spaAvailable) {
   });
 }
 
-export { updateStatus, setUserMemory, setWebChannel, setScheduler, setAgentSupervisor, setBackgroundTaskManager, setSpotifyClient, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback, setKanbanSupervisor, setKanbanBoardManager, setKanbanProviders, setIDEProviders };
+export { setShutdownHandler, setMcpManager };
+export { setStopCallback, setSessionBusyLookup, setQueueControls, setResearchControls, setTurnControls };
+export { updateStatus, setUserMemory, setWebChannel, setScheduler, setAgentSupervisor, setBackgroundTaskManager, setSpotifyClient, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback, setStatusSnapshotCallback, setKanbanSupervisor, setKanbanBoardManager, setKanbanProviders, setIDEProviders, setBotManager, setBotsWebhookSecret };
 
 let webServer: ReturnType<typeof createAdaptorServer> | null = null;
 
@@ -224,7 +297,7 @@ process.on('unhandledRejection', (reason: any) => {
   const fatal = /already running|EADDRINUSE|registerRuntimeProcess/i.test(message);
   if (fatal) {
     try {
-      process.stderr.write(`\n✗ Mercury cannot start: ${message}\n  Stop the other instance with \`mercury stop\` or \`kill <pid>\`.\n`);
+      process.stderr.write(`\n✗ Mercury cannot start: ${message}\n  Attach to it with \`mercury attach\`, or stop it with \`mercury stop\` / \`kill <pid>\`.\n`);
     } catch { /* stderr gone */ }
     process.exit(1);
   }
@@ -233,6 +306,8 @@ process.on('unhandledRejection', (reason: any) => {
 export function startWebServer(): { port: number; url: string } {
   const port = getWebPort();
   initWebAuth();
+  // Devices from before idle expiry start their clock now (they keep working).
+  try { migrateDevices(); } catch { /* checked again next start */ }
 
   if (spaAvailable) {
     logger.info(`React UI loaded from: ${uiDir}`);
@@ -243,9 +318,20 @@ export function startWebServer(): { port: number; url: string } {
   const server = createAdaptorServer({ fetch: app.fetch });
   webServer = server;
 
+  let bindAttempts = 0;
   server.on('error', (err: any) => {
+    if (err?.code === 'EADDRINUSE' && bindAttempts < 10) {
+      // A previous instance shutting down keeps the port for a moment;
+      // retry before declaring the dashboard unavailable.
+      bindAttempts++;
+      setTimeout(() => server.listen(port, '127.0.0.1'), 500);
+      return;
+    }
     if (err?.code === 'EADDRINUSE') {
-      logger.warn(`Port ${port} is already in use. Web dashboard unavailable.`);
+      // The runtime stays alive for its channels, but with no web listener
+      // every attach health check fails — the launcher treats that as an
+      // unresponsive runtime and restarts it. Log the shape of that state.
+      logger.warn(`Port ${port} is already in use — web dashboard unavailable. Attach/launch will report the runtime as unresponsive and restart it.`);
     } else {
       logger.error({ err: err.message }, 'Web server error');
     }

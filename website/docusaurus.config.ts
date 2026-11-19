@@ -3,8 +3,8 @@ import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
-  title: 'Mercury Agent — Soul-driven',
-  tagline: 'Soul-driven AI agent with permission-hardened tools, token budgets, and multi-channel access. Runs 24/7 from CLI, Web, Telegram, Discord, Slack, or Signal.',
+  title: 'Mercury Agent',
+  tagline: 'The open-source AI agent you can leave running. Remembers what matters, asks before it acts, works with any model.',
   favicon: 'img/logo-light.png',
 
   future: {
@@ -30,12 +30,22 @@ const config: Config = {
     },
     {
       tagName: 'meta',
-      attributes: { property: 'og:site_name', content: 'Mercury Agent — Soul-driven' },
+      attributes: { property: 'og:site_name', content: 'Mercury Agent' },
     },
     {
       tagName: 'meta',
       attributes: { name: 'application-name', content: 'Mercury Agent' },
     },
+    { tagName: 'link', attributes: { rel: 'preconnect', href: 'https://fonts.googleapis.com' } },
+    { tagName: 'link', attributes: { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: 'anonymous' } },
+    {
+      tagName: 'link',
+      attributes: {
+        rel: 'stylesheet',
+        href: 'https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap',
+      },
+    },
+    { tagName: 'link', attributes: { rel: 'apple-touch-icon', href: '/img/logo-light.png' } },
   ],
 
   i18n: {
@@ -48,13 +58,17 @@ const config: Config = {
     { src: '/js/plausible-init.js' },
   ],
 
+  // ```mermaid blocks render through src/theme/Mermaid (site palette, expand, mobile scroll).
+  markdown: { mermaid: true },
   themes: [
+    '@docusaurus/theme-mermaid',
     [
       '@easyops-cn/docusaurus-search-local',
       {
         hashed: true,
         language: ['en'],
-        indexBlog: false,
+        indexBlog: true,
+        blogRouteBasePath: '/blog',
         docsRouteBasePath: '/docs',
         highlightSearchTermsOnTargetPage: true,
       },
@@ -69,7 +83,34 @@ const config: Config = {
           sidebarPath: './sidebars.ts',
           editUrl: 'https://github.com/cosmicstack-labs/mercury-agent/tree/main/website/',
         },
-        blog: false,
+        blog: {
+          routeBasePath: 'blog',
+          path: 'blog',
+          blogTitle: 'Mercury Blog',
+          blogDescription: 'News, engineering notes and field reports from the team building Mercury, the open-source AI agent you can leave running.',
+          // The blog home shows every post: search, filters and sorting run client-side.
+          postsPerPage: 'ALL',
+          blogSidebarCount: 'ALL',
+          blogSidebarTitle: 'All posts',
+          showReadingTime: true,
+          authorsMapPath: 'authors.yml',
+          tags: 'tags.yml',
+          onInlineTags: 'throw',
+          onInlineAuthors: 'throw',
+          onUntruncatedBlogPosts: 'ignore',
+          // Docusaurus defaults, plus the guides that live in blog/ for authors and agents.
+          exclude: ['**/_*.{js,jsx,ts,tsx,md,mdx}', '**/_*/**', '**/*.test.{js,jsx,ts,tsx}', '**/__tests__/**', '**/README.md', '**/AGENTS.md', '**/CLAUDE.md'],
+          // Bare links on their own line become rich previews (X, YouTube, GitHub, Instagram…).
+          remarkPlugins: [require('./plugins/remark-social-embeds.cjs')],
+          editUrl: 'https://github.com/cosmicstack-labs/mercury-agent/tree/main/website/',
+          feedOptions: {
+            type: 'all',
+            title: 'Mercury Blog',
+            description: 'News, engineering notes and field reports from the team building Mercury.',
+            copyright: `© ${new Date().getFullYear()} Cosmic Stack`,
+            limit: 50,
+          },
+        },
         theme: {
           customCss: './src/css/custom.css',
         },
@@ -77,51 +118,101 @@ const config: Config = {
     ],
   ],
 
+  plugins: ['./plugins/llms-txt.cjs', './plugins/blog-social-cards.cjs'],
+
   themeConfig: {
-    image: 'img/card.png',
+    image: 'img/og/home.png',
+    metadata: [
+      {
+        name: 'keywords',
+        content: 'ai agent, open source ai agent, self-hosted ai agent, personal ai agent, cli agent, autonomous agent, telegram ai bot, coding agent, mercury agent',
+      },
+      { name: 'theme-color', content: '#0a0d10', media: '(prefers-color-scheme: dark)' },
+      { name: 'theme-color', content: '#fbfbf8', media: '(prefers-color-scheme: light)' },
+    ],
     colorMode: {
       respectPrefersColorScheme: true,
     },
+    // Bump with every release, together with RELEASE in src/components/Home/data.ts.
+    announcementBar: {
+      id: 'release-1-5-0',
+      content: '☿ Mercury 1.5.0 is out with <strong>Mercury Desktop</strong> for macOS, Windows and Linux, remote access you control, and updates that roll back on their own. <a href="/download">Download it →</a>',
+      isCloseable: true,
+    },
     navbar: {
-      title: '☿ Mercury Agent',
+      title: 'Mercury',
+      hideOnScroll: false,
       logo: {
-        alt: 'Mercury Agent — Soul-driven',
+        alt: 'Mercury Agent',
         src: 'img/logo-light.png',
         srcDark: 'img/logo-dark.png',
       },
       items: [
         {to: '/docs', label: 'Docs', position: 'left'},
-        {to: '/cloud', label: 'Mercury Cloud', position: 'left'},
-        {to: '/docs/releases/1.2.0', label: 'Releases', position: 'left'},
+        {to: '/docs/integrations/coding-workspace', label: 'Code', position: 'left'},
+        {to: '/docs/integrations/mercury-bots', label: 'Bots', position: 'left'},
+        {to: '/cloud', label: 'Cloud', position: 'left'},
+        {href: 'https://skills.mercuryagent.sh', label: 'Skills', position: 'left'},
+        {to: '/blog', label: 'Blog', position: 'left'},
+        {to: '/docs/releases', label: 'Changelog', position: 'left'},
         {
           href: 'https://github.com/cosmicstack-labs/mercury-agent',
-          label: 'GitHub',
           position: 'right',
+          className: 'navbar-github',
+          'aria-label': 'Mercury Agent on GitHub',
         },
+        {to: '/download', label: 'Download', position: 'right', className: 'navbar-cta'},
       ],
     },
     footer: {
-      style: 'dark',
+      style: 'light',
       links: [
+        {
+          title: 'Product',
+          items: [
+            {label: 'Download', to: '/download'},
+            {label: 'Install on a server', to: '/#install'},
+            {label: 'Mercury Code', to: '/docs/integrations/coding-workspace'},
+            {label: 'Mercury Bots', to: '/docs/integrations/mercury-bots'},
+            {label: 'Mercury Cloud', to: '/cloud'},
+            {label: 'Blog', to: '/blog'},
+            {label: 'Changelog', to: '/docs/releases'},
+          ],
+        },
+        {
+          title: 'Trust',
+          items: [
+            {label: 'Permissions model', to: '/docs/reference/permissions'},
+            {label: 'Second Brain memory', to: '/docs/reference/second-brain'},
+            {label: 'Completion contract', to: '/docs/reference/completion-architecture'},
+            {label: 'Honest comparison', to: '/#compare'},
+          ],
+        },
         {
           title: 'Docs',
           items: [
-            {label: 'Getting Started', to: '/docs'},
-            {label: 'Mercury Cloud', to: '/cloud'},
+            {label: 'Getting started', to: '/docs'},
+            {label: 'CLI commands', to: '/docs/cli-commands/cli-commands'},
+            {label: 'Built-in tools', to: '/docs/reference/built-in-tools'},
+            {label: 'Configuration', to: '/docs/reference/configuration'},
           ],
         },
         {
-          title: 'More',
+          title: 'Community',
           items: [
             {label: 'GitHub', href: 'https://github.com/cosmicstack-labs/mercury-agent'},
+            {label: 'Issues', href: 'https://github.com/cosmicstack-labs/mercury-agent/issues'},
+            {label: 'Skills registry', href: 'https://skills.mercuryagent.sh'},
+            {label: 'npm', href: 'https://www.npmjs.com/package/@cosmicstack/mercury-agent'},
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} Cosmic Stack. Built with Docusaurus.`,
+      copyright: `© ${new Date().getFullYear()} Cosmic Stack · Mercury Agent is MIT-licensed open source.`,
     },
     prism: {
       theme: prismThemes.github,
       darkTheme: prismThemes.dracula,
+      additionalLanguages: ['bash', 'diff', 'toml', 'powershell', 'ini', 'docker'],
     },
   } satisfies Preset.ThemeConfig,
 };

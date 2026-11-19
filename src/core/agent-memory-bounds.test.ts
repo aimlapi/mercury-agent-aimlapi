@@ -32,8 +32,11 @@ describe('agent memory bounds', () => {
 
   it('checks memory at every agent step boundary (event-loop independent)', () => {
     const agent = src('../core/agent.ts');
-    expect(agent).toContain('memoryGovernor(`stream-step-');
-    expect(agent).toContain('memoryGovernor(`gen-step-');
+    // One shared step handler serves both the streaming and the
+    // non-streaming path; the checkpoint label carries the path name.
+    expect(agent).toContain('memoryGovernor(`${path}-step-');
+    expect(agent).toContain("onStepFinish: stepHandler('stream')");
+    expect(agent).toContain("onStepFinish: stepHandler('gen')");
     expect(agent).toContain("from './memory-governor.js'");
   });
 
@@ -54,7 +57,10 @@ describe('agent memory bounds', () => {
   it('bounds Ink Static output and the streaming-tail projection', () => {
     const app = src('../ui/App.tsx');
     expect(app).toContain('MAX_STATIC_MESSAGES = 100');
-    expect(app).toContain('STREAM_TAIL_CHARS = 8 * 1024');
+    // The tail budget is still bounded (32KB slice through the markdown
+    // pipeline, hard 48-row ceiling) — "full preview" never means O(buffer).
+    expect(app).toContain('STREAM_TAIL_CHARS = 32 * 1024');
+    expect(app).toContain('STREAM_TAIL_MAX_LINES = 48');
     expect(app).toContain('!m.streaming &&');
     const channel = src('../channels/cli.ts');
     // Render notifications must leave the timer phase runnable (no microtask
