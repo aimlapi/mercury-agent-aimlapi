@@ -121,7 +121,7 @@ import { setSuggestionEngine } from './web/api/suggestions.js';
 import { artifactStore } from './artifacts/store.js';
 import { isWebAuthInitialized, setWebPassword, writeAttachToken, initWebAuth } from './web/auth.js';
 import { startLoopLagMonitor } from './utils/loop-lag.js';
-import { AIMLAPI_MCP_ID, aimlapiMcpKey, builtinMcpServers, McpManager, probeMcpServer, validateMcpConfig, type McpServerStatus } from './capabilities/mcp/index.js';
+import { AIMLAPI_MCP_ID, aimlapiMcpKey, builtinMcpServers, isAimlapiOffSwitch, McpManager, probeMcpServer, validateMcpConfig, type McpServerStatus } from './capabilities/mcp/index.js';
 import {
   addServer as addMcpServer,
   allowTools as allowMcpTools,
@@ -5653,6 +5653,11 @@ mcpCmd
   .description('Connect to an MCP server and list its tools')
   .action(mcpAction(async (id: string) => {
     const config = loadConfig();
+    const configured = config.mcp?.servers?.[id];
+    if (id === AIMLAPI_MCP_ID && configured && isAimlapiOffSwitch(configured)) {
+      // The off switch holds no key: probing it would only collect a 401.
+      throw new Error('The built-in AI/ML API server is turned off. Turn it back on with `mercury mcp enable aimlapi`.');
+    }
     const server = builtinMcpServers(config)[id] ?? getMcpServer(config, id);
     console.log('');
     const status = await probeMcpServer(id, server);
