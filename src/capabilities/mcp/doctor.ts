@@ -23,10 +23,14 @@ function disabledStatus(id: string, server: McpServerConfig): McpServerStatus {
   };
 }
 
-export async function collectMcpReport(raw: unknown, timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS): Promise<McpReport> {
+export async function collectMcpReport(
+  raw: unknown,
+  timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS,
+  builtins: Record<string, McpServerConfig> = {},
+): Promise<McpReport> {
   const validation = validateMcpConfig(raw);
   const servers = await Promise.all(
-    Object.entries(validation.servers).map(([id, server]) =>
+    Object.entries({ ...builtins, ...validation.servers }).map(([id, server]) =>
       server.enabled === false ? disabledStatus(id, server) : probeMcpServer(id, server, timeoutMs),
     ),
   );
@@ -72,7 +76,10 @@ export function summarizeMcpConfig(raw: unknown): string | null {
   return `MCP: ${total} server${total === 1 ? '' : 's'} configured (${enabled} enabled${invalid}). Check them with \`mercury doctor --mcp\`.`;
 }
 
-export async function runMcpDoctor(raw: unknown): Promise<{ lines: string[]; ok: boolean }> {
-  const report = await collectMcpReport(raw);
+export async function runMcpDoctor(
+  raw: unknown,
+  builtins: Record<string, McpServerConfig> = {},
+): Promise<{ lines: string[]; ok: boolean }> {
+  const report = await collectMcpReport(raw, DEFAULT_CONNECT_TIMEOUT_MS, builtins);
   return { lines: formatMcpReport(report), ok: !mcpReportFailed(report) };
 }

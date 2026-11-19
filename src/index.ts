@@ -121,7 +121,7 @@ import { setSuggestionEngine } from './web/api/suggestions.js';
 import { artifactStore } from './artifacts/store.js';
 import { isWebAuthInitialized, setWebPassword, writeAttachToken, initWebAuth } from './web/auth.js';
 import { startLoopLagMonitor } from './utils/loop-lag.js';
-import { McpManager, probeMcpServer, validateMcpConfig, type McpServerStatus } from './capabilities/mcp/index.js';
+import { AIMLAPI_MCP_ID, aimlapiMcpKey, builtinMcpServers, McpManager, probeMcpServer, validateMcpConfig, type McpServerStatus } from './capabilities/mcp/index.js';
 import {
   addServer as addMcpServer,
   allowTools as allowMcpTools,
@@ -2806,9 +2806,11 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
   const mcpConfig = validateMcpConfig(config.mcp);
   for (const problem of mcpConfig.problems) logger.warn({ problem }, 'MCP server skipped');
   for (const warning of mcpConfig.warnings) logger.warn({ warning }, 'MCP config warning');
+  const builtinMcp = builtinMcpServers(config);
+  if (builtinMcp[AIMLAPI_MCP_ID]) logger.info('AI/ML API MCP server on: an AI/ML API key is set (turn it off with `mercury mcp disable aimlapi`)');
   // Like plugins (ADR-025), only the runtime owner connects MCP servers: a
   // terminal attached to a live daemon must not start every stdio server twice.
-  const mcpManager = daemonOwnsRuntime ? undefined : new McpManager(mcpConfig.servers, {
+  const mcpManager = daemonOwnsRuntime ? undefined : new McpManager({ ...builtinMcp, ...mcpConfig.servers }, {
     gate: (request) => capabilities.permissions.checkMcpTool(request),
     resourceGate: (request) => capabilities.permissions.checkMcpResource(request),
   });
@@ -4375,7 +4377,8 @@ program
       return;
     }
     if (opts.mcp) {
-      const mcpDoctor = await runMcpDoctor(loadConfig().mcp);
+      const doctorConfig = loadConfig();
+      const mcpDoctor = await runMcpDoctor(doctorConfig.mcp, builtinMcpServers(doctorConfig));
       for (const line of mcpDoctor.lines) console.log(line);
       if (!mcpDoctor.ok) process.exitCode = 1;
       return;
@@ -5530,7 +5533,8 @@ mcpCmd
   .description('Show configured MCP servers')
   .action(mcpAction(() => {
     console.log('');
-    for (const line of formatMcpServerList(loadConfig())) {
+    const config = loadConfig();
+    for (const line of formatMcpServerList(config, builtinMcpServers(config))) {
       console.log(line.startsWith('  ') ? chalk.dim(`  ${line}`) : `  ${line}`);
     }
     console.log('');
@@ -5595,9 +5599,10 @@ mcpCmd
   .option('-y, --yes', 'do not ask for confirmation')
   .action(mcpAction(async (id: string, opts: { yes?: boolean }) => {
     const config = loadConfig();
-    const server = getMcpServer(config, id);
+    // The built-in AI/ML API server may have no entry to look up.
+    const server = config.mcp?.servers?.[id] ?? (id === AIMLAPI_MCP_ID ? undefined : getMcpServer(config, id));
     console.log('');
-    if (server.transport === 'stdio') {
+    if (server?.transport === 'stdio') {
       console.log(chalk.white(`  Mercury will start this command: ${formatMcpStdioCommand(server)}`));
       if (!opts.yes && !(await confirmMcp('Enable this server?'))) {
         console.log(chalk.dim('  Cancelled.'));
@@ -5606,6 +5611,9 @@ mcpCmd
       }
     }
     setMcpServerEnabled(config, id, true);
+    if (id === AIMLAPI_MCP_ID && !config.mcp?.servers?.[id] && !aimlapiMcpKey(config)) {
+      console.log(chalk.yellow('  ⚠ It stays off until an AI/ML API key is set: AIMLAPI_API_KEY in ~/.mercury/.env (keys: https://aimlapi.com/app/keys).'));
+    }
     saveMcpChange(config, `MCP server "${id}" enabled.`);
   }));
 
@@ -5644,7 +5652,8 @@ mcpCmd
   .command('test <id>')
   .description('Connect to an MCP server and list its tools')
   .action(mcpAction(async (id: string) => {
-    const server = getMcpServer(loadConfig(), id);
+    const config = loadConfig();
+    const server = builtinMcpServers(config)[id] ?? getMcpServer(config, id);
     console.log('');
     const status = await probeMcpServer(id, server);
     printMcpProbe(status);

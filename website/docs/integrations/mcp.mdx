@@ -69,11 +69,30 @@ Arguments:
 
 Answer **Yes** (this call), **Always** (this tool, in this chat, until Mercury restarts) or **No**.
 
+## AI/ML API, built in
+
+Mercury ships one MCP server you don't have to add: [AI/ML API](https://docs.aimlapi.com/quickstart/mcp)'s hosted server at `https://mcp.aimlapi.com/mcp`. It turns on by itself when an AI/ML API key is set, the same key the `aimlapi` provider uses:
+
+```bash
+# ~/.mercury/.env — get a key at https://aimlapi.com/app/keys
+AIMLAPI_API_KEY=your-key-here
+```
+
+A key saved by `mercury setup` for the AI/ML API provider counts too. Without a key the server stays off: nothing connects and nothing is billed.
+
+```bash
+mercury mcp test aimlapi      # connect and list its tools
+```
+
+All of its tools are visible to the agent. The free ones run without asking: model lookups (`models_list`, `models_search`, `model_get`, `models_compare`, `models_find_best`), `account_balance`, `account_usage`, `ping`, the Agent Tools catalog (`tools_search`, `tools_inspect`) and job and run status checks. Everything that bills your AI/ML API balance (chat, embeddings, image, video, audio and speech generation, OCR, `tools_run` and the `jev_*` searches) asks you first, even in Allow All mode.
+
+The key is sent only to `mcp.aimlapi.com`. To turn the server off, run `mercury mcp disable aimlapi`; `mercury mcp enable aimlapi` turns it back on. An `aimlapi` entry of your own in `mercury.yaml` replaces the built-in one completely.
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `mercury mcp list` | Configured servers, their tool filters, and env/header settings (secrets masked) |
+| `mercury mcp list` | Configured and built-in servers, their tool filters, and env/header settings (secrets masked) |
 | `mercury mcp add <id> --stdio <command> [-- args...]` | Add a local server |
 | `mercury mcp add <id> --http <url>` | Add a remote Streamable HTTP server |
 | `mercury mcp test <id>` | Connect once and list every tool as allowed, hidden or skipped |

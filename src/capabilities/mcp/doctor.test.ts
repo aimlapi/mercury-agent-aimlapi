@@ -33,6 +33,18 @@ describe('mercury doctor --mcp', () => {
     expect(lines.some((line) => line.startsWith('  ✗ mcp.servers.Broken: server id must match'))).toBe(true);
   }, 30_000);
 
+  it('probes built-in servers ahead of configured ones', async () => {
+    const report = await collectMcpReport(
+      { servers: { fx: { transport: 'stdio', command: process.execPath, args: [FIXTURE] } } },
+      5_000,
+      { builtin: { transport: 'stdio', command: process.execPath, args: [FIXTURE], tools: { allow: ['*'] } } },
+    );
+    expect(report.servers.map((s) => [s.id, s.state])).toEqual([
+      ['builtin', 'connected'],
+      ['fx', 'connected'],
+    ]);
+  }, 30_000);
+
   it('passes when everything connects and says so when nothing is configured', async () => {
     const report = await collectMcpReport(undefined);
     expect(mcpReportFailed(report)).toBe(false);

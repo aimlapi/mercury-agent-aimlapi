@@ -5,3 +5,4 @@ export { exposedToolName, isMcpToolName, MCP_TOOL_PREFIX, MAX_TOOL_NAME_LENGTH }
 export { McpManager, probeMcpServer, isToolAllowed, isToolAutoApproved } from './manager.js';
 export type { McpManagerOptions, McpBackoff } from './manager.js';
 export { callResultToText, MAX_RESULT_CHARS } from './result.js';
+export { builtinMcpServers, aimlapiMcpKey, AIMLAPI_MCP_ID, AIMLAPI_MCP_URL, AIMLAPI_MCP_FREE_TOOLS } from './builtin.js';

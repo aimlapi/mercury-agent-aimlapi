@@ -12,7 +12,7 @@ export const AIMLAPI_HOST = 'api.aimlapi.com';
 export const AIMLAPI_BASE_URL = `https://${AIMLAPI_HOST}/v1`;
 
 const PARTNER_ID = 'part_nl32eeP4aNn6xzoF09Cn2SOQ';
-const SOURCE = 'agent/mercury-agent';
+export const AIMLAPI_SOURCE = 'agent/mercury-agent';
 const REFERER = 'https://github.com/cosmicstack-labs/mercury-agent';
 const TITLE = 'Mercury Agent';
 
@@ -40,7 +40,7 @@ export function aimlapiHeaders(baseUrl: string): Record<string, string> | undefi
   if (!isAimlapiBaseUrl(baseUrl)) return undefined;
   return {
     'X-AIMLAPI-Partner-ID': PARTNER_ID,
-    'X-AIMLAPI-Source': SOURCE,
+    'X-AIMLAPI-Source': AIMLAPI_SOURCE,
     'HTTP-Referer': REFERER,
     'X-Title': TITLE,
   };

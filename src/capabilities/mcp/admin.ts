@@ -1,4 +1,5 @@
 import { redactSecrets } from '../../utils/redact.js';
+import { AIMLAPI_MCP_ID, AIMLAPI_MCP_URL, aimlapiOffSwitch, isAimlapiOffSwitch } from './builtin.js';
 import { validateMcpConfig } from './config.js';
 import type { McpConfig, McpServerConfig, McpServerStatus } from './types.js';
 
@@ -104,6 +105,18 @@ export function removeServer(config: ConfigWithMcp, id: string): void {
 }
 
 export function setServerEnabled(config: ConfigWithMcp, id: string, enabled: boolean): McpServerConfig {
+  const current = config.mcp?.servers?.[id];
+  if (id === AIMLAPI_MCP_ID && (!current || isAimlapiOffSwitch(current))) {
+    // The built-in AI/ML API server has no entry of its own: an entry that only
+    // says `enabled: false` turns it off, and removing that entry turns it back on.
+    if (enabled) {
+      if (current) delete servers(config)[id];
+      return { transport: 'http', url: AIMLAPI_MCP_URL };
+    }
+    const off = aimlapiOffSwitch();
+    servers(config)[id] = off;
+    return off;
+  }
   const server = getServer(config, id);
   if (enabled) delete server.enabled;
   else server.enabled = false;
@@ -162,19 +175,34 @@ function formatPairs(values: Record<string, string> | undefined): string {
     .join(', ');
 }
 
-export function formatServerList(config: ConfigWithMcp): string[] {
+function formatToolFilter(server: McpServerConfig): string {
+  const allow = server.tools?.allow ?? [];
+  const deny = server.tools?.deny ?? [];
+  const autoApprove = server.tools?.autoApprove ?? [];
+  return `  tools: ${allow.length ? `allow ${allow.join(', ')}` : 'none allowed'}`
+    + (deny.length ? ` · deny ${deny.join(', ')}` : '')
+    + (autoApprove.length ? ` · auto-approve ${autoApprove.join(', ')}` : '');
+}
+
+/**
+ * `builtins` are servers Mercury adds on its own (see builtin.ts). They are
+ * listed first, and never with their headers: those hold a resolved key, not
+ * an `${env:…}` reference.
+ */
+export function formatServerList(config: ConfigWithMcp, builtins: Record<string, McpServerConfig> = {}): string[] {
   const entries = Object.entries(config.mcp?.servers ?? {});
-  if (!entries.length) return ['No MCP servers configured. Add one with `mercury mcp add <id> --stdio <command>` or `--http <url>`.'];
+  const added = Object.entries(builtins).filter(([id]) => !config.mcp?.servers?.[id]);
+  if (!entries.length && !added.length) return ['No MCP servers configured. Add one with `mercury mcp add <id> --stdio <command>` or `--http <url>`.'];
   const lines: string[] = [];
+  for (const [id, server] of added) {
+    lines.push(`${id}  ${server.transport}  built-in  ${formatTarget(server)}`);
+    lines.push(formatToolFilter(server));
+    lines.push(`  turn off: mercury mcp disable ${id}`);
+  }
   for (const [id, server] of entries) {
     const state = server.enabled === false ? 'disabled' : 'enabled';
     lines.push(`${id}  ${server.transport}  ${state}  ${formatTarget(server)}`);
-    const allow = server.tools?.allow ?? [];
-    const deny = server.tools?.deny ?? [];
-    const autoApprove = server.tools?.autoApprove ?? [];
-    lines.push(`  tools: ${allow.length ? `allow ${allow.join(', ')}` : 'none allowed'}`
-      + (deny.length ? ` · deny ${deny.join(', ')}` : '')
-      + (autoApprove.length ? ` · auto-approve ${autoApprove.join(', ')}` : ''));
+    lines.push(formatToolFilter(server));
     if (server.resources) {
       const resources = server.resources;
       lines.push(redactSecrets(`  resources: ${resources.allow?.length ? `allow ${resources.allow.join(', ')}` : 'none allowed'}`

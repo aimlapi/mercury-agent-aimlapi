@@ -128,6 +128,29 @@ describe('editing servers', () => {
   });
 });
 
+describe('the built-in AI/ML API server', () => {
+  it('turns off with a keyless entry and back on by removing it', () => {
+    const config: Parameters<typeof admin.addServer>[0] = {};
+    admin.setServerEnabled(config, 'aimlapi', false);
+    expect(config.mcp?.servers?.aimlapi).toEqual({ transport: 'http', url: 'https://mcp.aimlapi.com/mcp', enabled: false });
+    admin.setServerEnabled(config, 'aimlapi', true);
+    expect(config.mcp?.servers?.aimlapi).toBeUndefined();
+    // Enabling it when it was never turned off writes nothing.
+    admin.setServerEnabled(config, 'aimlapi', true);
+    expect(config.mcp?.servers?.aimlapi).toBeUndefined();
+  });
+
+  it('leaves an owner-written aimlapi entry to the usual rules', () => {
+    const config: Parameters<typeof admin.addServer>[0] = {};
+    const own = { transport: 'http' as const, url: 'https://mcp.aimlapi.com/mcp', headers: { Authorization: 'Bearer ${env:MY_KEY}' } };
+    admin.addServer(config, 'aimlapi', { ...own });
+    admin.setServerEnabled(config, 'aimlapi', false);
+    expect(config.mcp?.servers?.aimlapi).toEqual({ ...own, enabled: false });
+    admin.setServerEnabled(config, 'aimlapi', true);
+    expect(config.mcp?.servers?.aimlapi).toEqual(own);
+  });
+});
+
 describe('formatting', () => {
   it('lists servers with masked literal values', () => {
     const lines = admin.formatServerList({
@@ -160,6 +183,27 @@ describe('formatting', () => {
       '  private network: allowed',
     ]);
     expect(admin.formatServerList({})[0]).toMatch(/^No MCP servers configured/);
+  });
+
+  it('lists built-in servers first, without their headers', () => {
+    const key = join2('aiml', '-test-key-0123456789abcdef');
+    const builtins = {
+      aimlapi: {
+        transport: 'http' as const,
+        url: 'https://mcp.aimlapi.com/mcp',
+        headers: { Authorization: `Bearer ${key}` },
+        tools: { allow: ['*'], autoApprove: ['ping'] },
+      },
+    };
+    const lines = admin.formatServerList({ mcp: { servers: { fx: { transport: 'stdio', command: 'node' } } } }, builtins);
+    expect(lines).toEqual([
+      'aimlapi  http  built-in  https://mcp.aimlapi.com/mcp',
+      '  tools: allow * · auto-approve ping',
+      '  turn off: mercury mcp disable aimlapi',
+      'fx  stdio  enabled  node',
+      '  tools: none allowed',
+    ]);
+    expect(admin.formatServerList({}, builtins)[0]).toBe('aimlapi  http  built-in  https://mcp.aimlapi.com/mcp');
   });
 
   const statuses: McpServerStatus[] = [
